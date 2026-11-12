@@ -35,4 +35,4 @@ jobs:
         run: pip install ${{ matrix.pip_args }}
 
       - name: Build production firmware
-        run: pio run -d firmware -e esp32-c6
+        run: pio run -d firmware -e esp32-c6 -e t2can-fd

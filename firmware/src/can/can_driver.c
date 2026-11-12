@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <string.h>
 
+#include "can/mcp2518fd.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -45,8 +46,12 @@ bus_status_t can_bus_health(int bus_id, uint32_t now_ms, uint32_t last_rx_ms)
 {
     if (bus_id < 0 || bus_id >= CAN_BUS_COUNT) return BUS_IDLE;
 
-    /* Drain edge flag and record timestamp while re-arming the interrupt. */
-    if (s_rx_edge[bus_id]) {
+    /* MCP2518FD has no transceiver RX pin on the ESP32. INT-pin wakes and
+     * error flags stand in for the TWAI edge monitor. */
+    if (s_configs[bus_id].backend == CAN_BACKEND_MCP2518FD) {
+        if (mcp2518fd_take_activity(bus_id)) s_last_edge_ms[bus_id] = now_ms;
+    } else if (s_rx_edge[bus_id]) {
+        /* Drain edge flag and record timestamp while re-arming the interrupt. */
         s_rx_edge[bus_id] = false;
         s_last_edge_ms[bus_id] = now_ms;
         gpio_intr_enable(s_rx_ctx[bus_id].pin);
@@ -102,6 +107,15 @@ esp_err_t can_bus_install(const can_bus_config_t *cfg)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (cfg->backend == CAN_BACKEND_MCP2518FD) {
+        s_configs[cfg->bus_id] = *cfg;
+        esp_err_t err = mcp2518fd_install(cfg);
+        if (err != ESP_OK) return err;
+        s_bitrates[cfg->bus_id] = cfg->bitrate_kbps;
+        return ESP_OK;
+    }
+    if (cfg->backend != CAN_BACKEND_TWAI) return ESP_ERR_INVALID_ARG;
+
     s_configs[cfg->bus_id] = *cfg;
 
     // TCAN1044: STB high = standby, STB low = normal operation.
@@ -118,7 +132,7 @@ esp_err_t can_bus_install(const can_bus_config_t *cfg)
     if (!s_isr_service_up) { gpio_install_isr_service(0); s_isr_service_up = true; }
 
     twai_general_config_t gcfg = TWAI_GENERAL_CONFIG_DEFAULT_V2(
-        cfg->bus_id, cfg->tx_pin, cfg->rx_pin, TWAI_MODE_NORMAL);
+        cfg->twai_controller, cfg->tx_pin, cfg->rx_pin, TWAI_MODE_NORMAL);
     gcfg.tx_queue_len = cfg->tx_queue_len ? cfg->tx_queue_len : 8;
     gcfg.rx_queue_len = cfg->rx_queue_len ? cfg->rx_queue_len : 16;
 
@@ -165,6 +179,14 @@ esp_err_t can_bus_set_bitrate(int bus_id, uint32_t kbps)
     if (bus_id < 0 || bus_id >= CAN_BUS_COUNT) return ESP_ERR_INVALID_ARG;
     if (kbps != 125 && kbps != 250 && kbps != 500 && kbps != 1000)
         return ESP_ERR_INVALID_ARG;
+    if (s_configs[bus_id].backend == CAN_BACKEND_MCP2518FD) {
+        esp_err_t err = mcp2518fd_set_bitrate(bus_id, kbps);
+        if (err == ESP_OK) {
+            s_configs[bus_id].bitrate_kbps = kbps;
+            s_bitrates[bus_id] = kbps;
+        }
+        return err;
+    }
     if (s_buses[bus_id] == NULL) return ESP_ERR_INVALID_STATE;
 
     /* twai_stop_v2 requires RUNNING state. If the bus is in BUS_OFF (or already
@@ -195,7 +217,8 @@ esp_err_t can_bus_set_bitrate(int bus_id, uint32_t kbps)
     s_configs[bus_id].bitrate_kbps = kbps;
 
     twai_general_config_t gcfg = TWAI_GENERAL_CONFIG_DEFAULT_V2(
-        bus_id, s_configs[bus_id].tx_pin, s_configs[bus_id].rx_pin, TWAI_MODE_NORMAL);
+        s_configs[bus_id].twai_controller, s_configs[bus_id].tx_pin,
+        s_configs[bus_id].rx_pin, TWAI_MODE_NORMAL);
     gcfg.tx_queue_len = s_configs[bus_id].tx_queue_len ? s_configs[bus_id].tx_queue_len : 8;
     gcfg.rx_queue_len = s_configs[bus_id].rx_queue_len ? s_configs[bus_id].rx_queue_len : 16;
 
@@ -226,12 +249,17 @@ esp_err_t can_bus_send(int bus_id, uint32_t id,
                        const uint8_t *data, uint8_t len,
                        uint32_t timeout_ms)
 {
-    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT || s_buses[bus_id] == NULL) {
-        return ESP_ERR_INVALID_STATE;
+    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT) return ESP_ERR_INVALID_STATE;
+    if (len > 8) return ESP_ERR_INVALID_ARG;
+    if (s_configs[bus_id].backend == CAN_BACKEND_MCP2518FD) {
+        esp_err_t err = mcp2518fd_send(bus_id, id, data, len, timeout_ms);
+        if (err == ESP_OK) {
+            s_last_tx_ms[bus_id] = (uint32_t)(esp_timer_get_time() / 1000);
+            ESP_LOGV(TAG, "bus%d tx 0x%03" PRIx32 " [%d]", bus_id, id, len);
+        }
+        return err;
     }
-    if (len > 8) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (s_buses[bus_id] == NULL) return ESP_ERR_INVALID_STATE;
 
     twai_message_t msg = {0};
     msg.identifier = id;
@@ -249,9 +277,15 @@ esp_err_t can_bus_send(int bus_id, uint32_t id,
 
 esp_err_t can_bus_receive(int bus_id, twai_message_t *out, uint32_t timeout_ms)
 {
-    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT || s_buses[bus_id] == NULL || !out) {
-        return ESP_ERR_INVALID_STATE;
+    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT || !out) return ESP_ERR_INVALID_STATE;
+    if (s_configs[bus_id].backend == CAN_BACKEND_MCP2518FD) {
+        esp_err_t err = mcp2518fd_receive(bus_id, out, timeout_ms);
+        if (err == ESP_OK) {
+            ESP_LOGV(TAG, "bus%d rx 0x%03" PRIx32 " [%d]", bus_id, out->identifier, out->data_length_code);
+        }
+        return err;
     }
+    if (s_buses[bus_id] == NULL) return ESP_ERR_INVALID_STATE;
     esp_err_t err = twai_receive_v2(s_buses[bus_id], out, pdMS_TO_TICKS(timeout_ms));
     if (err == ESP_OK) {
         ESP_LOGV(TAG, "bus%d rx 0x%03" PRIx32 " [%d]", bus_id, out->identifier, out->data_length_code);
@@ -261,15 +295,22 @@ esp_err_t can_bus_receive(int bus_id, twai_message_t *out, uint32_t timeout_ms)
 
 esp_err_t can_bus_status(int bus_id, twai_status_info_t *out)
 {
-    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT || s_buses[bus_id] == NULL || !out) {
-        return ESP_ERR_INVALID_STATE;
+    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT || !out) return ESP_ERR_INVALID_STATE;
+    if (s_configs[bus_id].backend == CAN_BACKEND_MCP2518FD) {
+        return mcp2518fd_status(bus_id, out);
     }
+    if (s_buses[bus_id] == NULL) return ESP_ERR_INVALID_STATE;
     return twai_get_status_info_v2(s_buses[bus_id], out);
 }
 
 void can_bus_off_recover(int bus_id)
 {
-    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT || s_buses[bus_id] == NULL) return;
+    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT) return;
+    if (s_configs[bus_id].backend == CAN_BACKEND_MCP2518FD) {
+        mcp2518fd_bus_off_recover(bus_id);
+        return;
+    }
+    if (s_buses[bus_id] == NULL) return;
 
     static uint32_t s_off_since_ms[CAN_BUS_COUNT];
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
