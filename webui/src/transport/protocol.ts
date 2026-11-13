@@ -302,8 +302,21 @@ export class Protocol {
             );
           } else if (resp.type === 'trace') {
             if (this.traceCallback) {
-              const data = new Uint8Array(((resp.data ?? '') as string).match(/.{2}/g)?.map((h: string) => parseInt(h, 16)) ?? []);
-              this.traceCallback({ bus: resp.bus ?? 0, id: resp.id ?? 0, ts: resp.ts ?? 0, data });
+              this.traceCallback({ bus: resp.bus ?? 0, id: resp.id ?? 0, ts: resp.ts ?? 0, data: hexToBytes(resp.data) });
+            }
+          } else if (resp.type === 'trace_batch') {
+            // Compact batched trace (firmware >= fd17b56+1, only when
+            // trace.start was called with batch:true): f = [[bus,id,ts,"hex"],...]
+            if (this.traceCallback && Array.isArray(resp.f)) {
+              for (const e of resp.f as unknown[]) {
+                if (!Array.isArray(e)) continue;
+                this.traceCallback({
+                  bus: Number(e[0] ?? 0),
+                  id: Number(e[1] ?? 0),
+                  ts: Number(e[2] ?? 0),
+                  data: hexToBytes(e[3]),
+                });
+              }
             }
           } else if (resp.type === 'signal') {
             if (this.signalCallback) this.signalCallback({
@@ -414,7 +427,9 @@ export class Protocol {
 
   /** Start streaming raw frames. `buses` defaults to both. */
   traceStart(buses: number[] = [0, 1]): Promise<void> {
-    return this.call('trace.start', { buses });
+    // batch:true asks for compact 'trace_batch' pushes (many frames per BLE
+    // notification). Older firmware ignores the flag and sends 'trace'.
+    return this.call('trace.start', { buses, batch: true });
   }
 
   traceStop(): Promise<void> {
@@ -590,4 +605,11 @@ export class Protocol {
       onProgress?.(sent, bin.length);
     }
   }
+}
+
+function hexToBytes(hex: unknown): Uint8Array {
+  if (typeof hex !== 'string' || hex.length < 2) return new Uint8Array(0);
+  const out = new Uint8Array(hex.length >> 1);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
 }

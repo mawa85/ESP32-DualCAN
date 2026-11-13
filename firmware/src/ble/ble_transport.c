@@ -20,9 +20,11 @@
  */
 #include "ble/ble_transport.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nimble/nimble_port.h"
@@ -64,6 +66,9 @@ static uint16_t s_tx_attr_handle;
  * (CCCD write, or restored for a bonded peer). Before that, notifies would
  * only compete with service discovery for the few ACL/mbuf buffers. */
 static volatile bool s_tx_subscribed;
+static volatile uint32_t s_ntf_ok, s_ntf_enomem, s_ntf_err, s_ntf_tx_events;
+static uint32_t s_ntf_warn_ms;
+
 /* Fallback: some centrals (Windows with a cached CCCD on a bonded device)
  * never rewrite the CCCD on reconnect. After this grace period notifies are
  * allowed anyway; by then service discovery is normally done. */
@@ -521,6 +526,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                  event->repeat_pairing.conn_handle);
         return BLE_GAP_REPEAT_PAIRING_RETRY;
 
+    case BLE_GAP_EVENT_NOTIFY_TX:
+        /* One per notify: count only (was a per-notify debug line). */
+        s_ntf_tx_events++;
+        break;
+
     default:
         ESP_LOGD(TAG, "gap event type=%d", event->type);
         break;
@@ -623,6 +633,11 @@ int dorky_ble_init(ble_request_cb_t on_request, void *ctx)
     return 0;
 }
 
+/* ---- notify statistics + back-pressure ----
+ * Never log per notify: at a few hundred notifies/s the log line itself
+ * (USB console + BLE log mirror) becomes the load. Count instead and let
+ * dorky_ble_tx_stats() / the heartbeat print the totals. */
+
 int dorky_ble_notify(const uint8_t *data, size_t len)
 {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return -1;
@@ -630,16 +645,44 @@ int dorky_ble_notify(const uint8_t *data, size_t len)
 
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     if (!om) {
-        if (dorky_debug_enabled())
-            ESP_LOGW(TAG, "notify ENOMEM (mbuf) len=%u", (unsigned)len);
+        s_ntf_enomem++;
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (dorky_debug_enabled() && (now - s_ntf_warn_ms) >= 5000) {
+            s_ntf_warn_ms = now;
+            ESP_LOGW(TAG, "notify ENOMEM (mbuf) x%" PRIu32 " total, msys free=%d",
+                     s_ntf_enomem, os_msys_num_free());
+        }
         return BLE_HS_ENOMEM;
     }
 
+    /* ble_gatts_notify_custom consumes om on success and on failure. */
     int rc = ble_gatts_notify_custom(s_conn_handle, s_tx_attr_handle, om);
-    if (rc != 0 && dorky_debug_enabled()) {
-        ESP_LOGW(TAG, "notify failed rc=%d len=%u", rc, (unsigned)len);
-    }
+    if (rc == 0) s_ntf_ok++;
+    else         s_ntf_err++;
     return rc;
+}
+
+bool dorky_ble_tx_credit(int chunks)
+{
+    if (!dorky_ble_tx_ready()) return false;
+    /* Keep a reserve of host buffers for ATT responses / SMP / L2CAP. */
+    if (os_msys_num_free() < chunks * 2 + DORKY_BLE_MSYS_RESERVE) return false;
+    /* The BT controller allocates from internal RAM at runtime; when that
+     * runs dry it hits "BLE_INIT: Malloc failed" and later asserts in its
+     * own task. Never add optional traffic below this watermark. */
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < DORKY_BLE_INTERNAL_RESERVE)
+        return false;
+    return true;
+}
+
+void dorky_ble_tx_stats(dorky_ble_tx_stats_t *out)
+{
+    if (!out) return;
+    out->ok = s_ntf_ok;
+    out->enomem = s_ntf_enomem;
+    out->err = s_ntf_err;
+    out->tx_events = s_ntf_tx_events;
+    out->msys_free = os_msys_num_free();
 }
 
 bool dorky_ble_tx_ready(void)

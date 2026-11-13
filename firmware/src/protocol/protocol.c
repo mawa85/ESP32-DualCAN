@@ -122,8 +122,8 @@ static void send_frame_ex(cJSON *resp, int mode)
     if (mode == SEND_DROPPABLE) {
         /* All-or-nothing: only start if the msys pool clearly has room for
          * every chunk, so a dropped push never truncates the byte stream. */
-        int need = (int)((total + chunk - 1) / chunk) + 4;
-        if (dorky_ble_free_bufs() < need ||
+        int need = (int)((total + chunk - 1) / chunk);
+        if (!dorky_ble_tx_credit(need) ||
             (s_send_mutex && xSemaphoreTake(s_send_mutex, 0) != pdTRUE)) {
             s_dropped_pushes++;
             free(frame);
@@ -336,25 +336,71 @@ static int log_vprintf_hook(const char *fmt, va_list args)
 
 static const char HEX[] = "0123456789ABCDEF";
 
-/* ---- trace subscription + rate limit ----
- * trace.start { buses:[0,1], ids:[0x118,...] (optional), max_fps: 200 }.
- * Only subscribed buses/IDs are streamed, through a token bucket, and the
- * subscription is cleared when the central disconnects. */
+/* ---- trace: subscription, rate limit, batching, flow control ----
+ *
+ * trace.start { buses:[0,1], ids:[0x118,...], max_fps:200, batch:true }
+ *
+ * Old firmware sent one notify per CAN frame (~76 B each). At a few hundred
+ * frames/s that exhausted the NimBLE msys pool (thousands of ENOMEM) and
+ * the BT controller's internal-RAM allocations ("BLE_INIT: Malloc failed",
+ * then an assert inside the controller task). Now:
+ *   1. can_poll() only appends to a small ring (same task, no locking).
+ *   2. protocol_tick() flushes every TRACE_FLUSH_MS (or when the ring has a
+ *      full notify worth) and packs as many frames as fit into ONE notify of
+ *      (MTU-3) bytes. Every packed item is a complete length-prefixed frame,
+ *      so the byte stream stays aligned for any client.
+ *        - default: legacy {"type":"trace",...} frames back-to-back - the
+ *          existing web UI parser already loops over frames in a notify.
+ *        - batch:true: one {"type":"trace_batch","f":[[bus,id,ts,"hex"],..]}
+ *          per notify (~2.5x more frames per notify).
+ *   3. A notify is only attempted when dorky_ble_tx_credit() says there are
+ *      spare msys buffers and internal RAM, and at most TRACE_NOTIFY_HZ per
+ *      second. Otherwise frames wait in the ring; when the ring overflows the
+ *      oldest are dropped and counted (ble_dropped). Nothing ever retries.
+ */
 #define TRACE_MAX_IDS        32
 #define TRACE_DEFAULT_FPS    200
 #define TRACE_FPS_LIMIT      1000
+#define TRACE_RING           128      /* power of two */
+#define TRACE_FLUSH_MS       25
+#define TRACE_NOTIFY_HZ      40
+#define TRACE_NOTIFY_BURST   3
+#define TRACE_PKT_MAX        509      /* MTU 512 - 3 */
+
+typedef struct {
+    uint32_t id;
+    uint32_t ts;
+    uint8_t  bus;
+    uint8_t  dlc;
+    uint8_t  data[8];
+} trace_item_t;
+
 static uint32_t s_trace_ids[TRACE_MAX_IDS];
 static int      s_trace_id_count;      /* 0 = all IDs on the subscribed buses */
 static uint32_t s_trace_fps = TRACE_DEFAULT_FPS;
+static bool     s_trace_batch;         /* client understands trace_batch */
 static uint32_t s_trace_tokens;
 static uint32_t s_trace_refill_ms;
-static uint32_t s_trace_dropped;
+static uint32_t s_trace_dropped;       /* rate limit (max_fps) */
+static uint32_t s_trace_ble_dropped;   /* ring overflow / no BLE credit */
+static uint32_t s_trace_sent;          /* frames delivered to the stack */
+static uint32_t s_trace_notifies;
+static trace_item_t s_trace_ring[TRACE_RING];
+static uint32_t s_trace_head, s_trace_tail;   /* head = write, tail = read */
+static uint32_t s_trace_last_flush_ms;
+static uint32_t s_trace_ntf_tokens;
+static uint32_t s_trace_ntf_refill_ms;
+
+static inline uint32_t trace_pending(void) { return s_trace_head - s_trace_tail; }
 
 static void trace_reset(void)
 {
     s_trace_buses = 0;
     s_trace_id_count = 0;
     s_trace_fps = TRACE_DEFAULT_FPS;
+    s_trace_batch = false;
+    s_trace_ble_dropped += trace_pending();
+    s_trace_head = s_trace_tail = 0;
 }
 
 static bool trace_take_token(uint32_t now_ms)
@@ -388,24 +434,154 @@ static void trace_observer(int bus_id, const twai_message_t *frame, uint32_t now
     }
     if (!trace_take_token(now_ms)) { s_trace_dropped++; return; }
 
-    /* Hex-encode the data inline (max 16 chars + NUL). cJSON will copy it. */
-    char hex[17];
-    int dlc = frame->data_length_code;
-    if (dlc > 8) dlc = 8;
-    for (int i = 0; i < dlc; i++) {
-        hex[2*i]     = HEX[(frame->data[i] >> 4) & 0xF];
-        hex[2*i + 1] = HEX[frame->data[i] & 0xF];
+    if (trace_pending() >= TRACE_RING) {          /* overflow: drop oldest */
+        s_trace_tail++;
+        s_trace_ble_dropped++;
     }
-    hex[2*dlc] = '\0';
+    trace_item_t *it = &s_trace_ring[s_trace_head & (TRACE_RING - 1)];
+    it->id = frame->identifier;
+    it->ts = now_ms;
+    it->bus = (uint8_t)bus_id;
+    it->dlc = frame->data_length_code > 8 ? 8 : frame->data_length_code;
+    memcpy(it->data, frame->data, it->dlc);
+    s_trace_head++;
+}
 
-    cJSON *push = cJSON_CreateObject();
-    cJSON_AddStringToObject(push, "type", "trace");
-    cJSON_AddNumberToObject(push, "bus", bus_id);
-    cJSON_AddNumberToObject(push, "id",  (double)frame->identifier);
-    cJSON_AddNumberToObject(push, "ts",  (double)now_ms);
-    cJSON_AddStringToObject(push, "data", hex);
-    send_frame_ex(push, SEND_DROPPABLE);
-    cJSON_Delete(push);
+static int hex_encode(char *out, const uint8_t *d, int n)
+{
+    for (int i = 0; i < n; i++) {
+        out[2*i]     = HEX[(d[i] >> 4) & 0xF];
+        out[2*i + 1] = HEX[d[i] & 0xF];
+    }
+    out[2*n] = '\0';
+    return 2*n;
+}
+
+static void put_hdr(uint8_t *p, uint32_t len)
+{
+    p[0] = (uint8_t)(len & 0xFF);
+    p[1] = (uint8_t)((len >> 8) & 0xFF);
+    p[2] = (uint8_t)((len >> 16) & 0xFF);
+    p[3] = (uint8_t)((len >> 24) & 0x0F);   /* type nibble 0 = JSON */
+}
+
+/* Pack legacy frames: [hdr]{"type":"trace",...}[hdr]{...}... */
+static size_t trace_pack_legacy(uint8_t *buf, size_t cap, uint32_t *taken)
+{
+    size_t off = 0;
+    uint32_t n = 0;
+    while (n < trace_pending()) {
+        const trace_item_t *it = &s_trace_ring[(s_trace_tail + n) & (TRACE_RING - 1)];
+        char hex[17], js[128];
+        hex_encode(hex, it->data, it->dlc);
+        int jl = snprintf(js, sizeof js,
+                          "{\"type\":\"trace\",\"bus\":%u,\"id\":%" PRIu32 ",\"ts\":%" PRIu32 ",\"data\":\"%s\"}",
+                          (unsigned)it->bus, it->id, it->ts, hex);
+        if (jl <= 0 || (size_t)jl >= sizeof js) break;
+        if (off + FRAME_HDR_LEN + (size_t)jl > cap) break;
+        put_hdr(buf + off, (uint32_t)jl);
+        memcpy(buf + off + FRAME_HDR_LEN, js, (size_t)jl);
+        off += FRAME_HDR_LEN + (size_t)jl;
+        n++;
+    }
+    *taken = n;
+    return off;
+}
+
+/* Pack one compact frame: [hdr]{"type":"trace_batch","f":[[b,id,ts,"hex"],...]} */
+static size_t trace_pack_batch(uint8_t *buf, size_t cap, uint32_t *taken)
+{
+    static const char head[] = "{\"type\":\"trace_batch\",\"f\":[";
+    static const char tail[] = "]}";
+    size_t off = FRAME_HDR_LEN;
+    uint32_t n = 0;
+    if (cap < FRAME_HDR_LEN + sizeof head + sizeof tail + 40) { *taken = 0; return 0; }
+    memcpy(buf + off, head, sizeof head - 1);
+    off += sizeof head - 1;
+    while (n < trace_pending()) {
+        const trace_item_t *it = &s_trace_ring[(s_trace_tail + n) & (TRACE_RING - 1)];
+        char hex[17], js[64];
+        hex_encode(hex, it->data, it->dlc);
+        int jl = snprintf(js, sizeof js, "%s[%u,%" PRIu32 ",%" PRIu32 ",\"%s\"]",
+                          n ? "," : "", (unsigned)it->bus, it->id, it->ts, hex);
+        if (jl <= 0 || (size_t)jl >= sizeof js) break;
+        if (off + (size_t)jl + (sizeof tail - 1) > cap) break;
+        memcpy(buf + off, js, (size_t)jl);
+        off += (size_t)jl;
+        n++;
+    }
+    if (n == 0) { *taken = 0; return 0; }
+    memcpy(buf + off, tail, sizeof tail - 1);
+    off += sizeof tail - 1;
+    put_hdr(buf, (uint32_t)(off - FRAME_HDR_LEN));
+    *taken = n;
+    return off;
+}
+
+static bool trace_notify_token(uint32_t now)
+{
+    uint32_t dt = now - s_trace_ntf_refill_ms;
+    uint32_t add = dt * TRACE_NOTIFY_HZ / 1000u;
+    if (add) {
+        s_trace_ntf_tokens += add;
+        if (s_trace_ntf_tokens > TRACE_NOTIFY_BURST) s_trace_ntf_tokens = TRACE_NOTIFY_BURST;
+        s_trace_ntf_refill_ms = now;
+    }
+    if (!s_trace_ntf_tokens) return false;
+    s_trace_ntf_tokens--;
+    return true;
+}
+
+/* Called from protocol_tick (app task). Sends at most one notify per call. */
+static void trace_flush(uint32_t now)
+{
+    if (!s_trace_buses || trace_pending() == 0) return;
+    if (!dorky_ble_tx_ready()) return;
+
+    uint16_t mtu = dorky_ble_mtu();
+    size_t cap = mtu > 23 ? (size_t)mtu - 3 : 20;
+    if (cap > TRACE_PKT_MAX) cap = TRACE_PKT_MAX;
+    if (cap < 100) {          /* tiny MTU: batching impossible, drop */
+        s_trace_ble_dropped += trace_pending();
+        s_trace_tail = s_trace_head;
+        return;
+    }
+    /* "Full" = roughly one notify worth of frames waiting. */
+    uint32_t full = (uint32_t)(cap / (s_trace_batch ? 32 : 80));
+    if ((now - s_trace_last_flush_ms) < TRACE_FLUSH_MS && trace_pending() < full) return;
+    if (!trace_notify_token(now)) return;
+    if (!dorky_ble_tx_credit(1)) return;               /* wait; ring absorbs */
+    if (s_send_mutex && xSemaphoreTake(s_send_mutex, 0) != pdTRUE) return;
+
+    static uint8_t pkt[TRACE_PKT_MAX];
+    uint32_t taken = 0;
+    size_t len = s_trace_batch ? trace_pack_batch(pkt, cap, &taken)
+                               : trace_pack_legacy(pkt, cap, &taken);
+    if (len > 0 && taken > 0) {
+        if (dorky_ble_notify(pkt, len) == 0) {
+            s_trace_sent += taken;
+            s_trace_notifies++;
+        } else {
+            s_trace_ble_dropped += taken;               /* never retry */
+        }
+        s_trace_tail += taken;
+    }
+    if (s_send_mutex) xSemaphoreGive(s_send_mutex);
+    s_trace_last_flush_ms = now;
+}
+
+void protocol_stats_line(char *buf, size_t len)
+{
+    dorky_ble_tx_stats_t st;
+    dorky_ble_tx_stats(&st);
+    snprintf(buf, len,
+             "trace=%s fps=%" PRIu32 "%s sent=%" PRIu32 " ntf=%" PRIu32 " rate_drop=%" PRIu32
+             " ble_drop=%" PRIu32 " push_drop=%" PRIu32 " | ble ntf ok=%" PRIu32 " enomem=%" PRIu32
+             " err=%" PRIu32 " msys_free=%d iram_free=%u",
+             s_trace_buses ? "on" : "off", s_trace_fps, s_trace_batch ? " batch" : "",
+             s_trace_sent, s_trace_notifies, s_trace_dropped, s_trace_ble_dropped,
+             s_dropped_pushes, st.ok, st.enomem, st.err, st.msys_free,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 
 static void push_bus_status(int bus, bus_status_t status, uint16_t rate)
@@ -708,26 +884,41 @@ static void handle_trace_start(int id, cJSON *req)
         if (fps > TRACE_FPS_LIMIT) fps = TRACE_FPS_LIMIT;
     }
 
+    const cJSON *batch_j = cJSON_GetObjectItem(req, "batch");
+
+    s_trace_head = s_trace_tail = 0;
+    s_trace_batch = cJSON_IsTrue(batch_j);
+    s_trace_ble_dropped = 0;
+    s_trace_sent = 0;
+    s_trace_notifies = 0;
     s_trace_id_count = n;
     s_trace_fps = fps;
     s_trace_tokens = fps / 10u + 1u;
     s_trace_refill_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_trace_dropped = 0;
     s_trace_buses = mask;
-    ESP_LOGI(TAG, "trace.start mask=0x%02x ids=%d max_fps=%" PRIu32, mask, n, fps);
+    ESP_LOGI(TAG, "trace.start mask=0x%02x ids=%d max_fps=%" PRIu32 " %s",
+             mask, n, fps, s_trace_batch ? "batch" : "legacy-packed");
 
     cJSON *result = cJSON_CreateObject();
     cJSON_AddNumberToObject(result, "max_fps", fps);
     cJSON_AddNumberToObject(result, "ids", n);
+    cJSON_AddBoolToObject(result, "batch", s_trace_batch);
     send_ok(id, result);
 }
 
 static void handle_trace_stop(int id)
 {
     trace_reset();
-    ESP_LOGI(TAG, "trace.stop (rate-dropped %" PRIu32 ")", s_trace_dropped);
+    ESP_LOGI(TAG, "trace.stop sent=%" PRIu32 " notifies=%" PRIu32 " rate-dropped=%" PRIu32
+             " ble-dropped=%" PRIu32, s_trace_sent, s_trace_notifies, s_trace_dropped,
+             s_trace_ble_dropped);
     cJSON *result = cJSON_CreateObject();
-    cJSON_AddNumberToObject(result, "dropped", (double)s_trace_dropped);
+    cJSON_AddNumberToObject(result, "sent", (double)s_trace_sent);
+    cJSON_AddNumberToObject(result, "notifies", (double)s_trace_notifies);
+    cJSON_AddNumberToObject(result, "dropped", (double)s_trace_dropped);       /* rate limit (compat name) */
+    cJSON_AddNumberToObject(result, "rate_dropped", (double)s_trace_dropped);
+    cJSON_AddNumberToObject(result, "ble_dropped", (double)s_trace_ble_dropped);
     cJSON_AddNumberToObject(result, "push_dropped", (double)s_dropped_pushes);
     send_ok(id, result);
 }
@@ -1453,6 +1644,8 @@ void protocol_tick(void)
         }
         free(fi.data);
     }
+
+    trace_flush((uint32_t)(esp_timer_get_time() / 1000));
 
     /* Bus status monitor: evaluate every 200 ms. Push on state change for
      * responsiveness, plus a 1 s heartbeat so the UI sees fresh frame-rate

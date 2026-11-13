@@ -58,3 +58,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
 CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
+
+# BLE under trace load (see protocol.c trace_flush): a few more host buffers
+# (internal RAM, +~6 KB) so ATT responses always find an mbuf next to batched
+# trace notifies. WiFi/LWIP buffers go to PSRAM to leave internal RAM for the
+# BT controller, which allocates from it at runtime ("BLE_INIT: Malloc failed").
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=32
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y

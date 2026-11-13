@@ -37,3 +37,6 @@ void protocol_init(script_loader_t *loader);
  * all Berry VM access happens on a single task (avoids races with the NimBLE
  * task that calls protocol_on_ble_write). */
 void protocol_tick(void);
+
+/* One-line trace/BLE statistics for the debug heartbeat. */
+void protocol_stats_line(char *buf, size_t len);

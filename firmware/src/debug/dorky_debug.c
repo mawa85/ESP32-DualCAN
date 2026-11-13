@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "storage/state.h"
+#include "protocol/protocol.h"
 #include "sdkconfig.h"
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #include "driver/usb_serial_jtag.h"
@@ -194,9 +195,18 @@ void dorky_debug_heartbeat(void)
         off += (size_t)n;
     }
 
-    ESP_LOGI(TAG, "hb up=%lus heap=%lu min=%lu psram=%lu %s %s",
+    ESP_LOGI(TAG, "hb up=%lus heap=%lu min=%lu psram=%lu iram=%lu iram_min=%lu iram_big=%lu %s %s",
              (unsigned long)up_s, (unsigned long)heap, (unsigned long)min_heap,
-             (unsigned long)psram, ble, buses);
+             (unsigned long)psram,
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             ble, buses);
+    {
+        char st[256];
+        protocol_stats_line(st, sizeof st);
+        ESP_LOGI(TAG, "hb %s", st);
+    }
 
     /* Stack high-water marks: remaining free stack in bytes, lowest first. */
     TaskStatus_t tasks[24];

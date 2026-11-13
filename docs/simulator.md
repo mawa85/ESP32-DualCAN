@@ -199,6 +199,12 @@ Konsole: `filter` zeigt die aktiven Listen.
 - Trace nur auf Abo: `trace.start {buses, ids, max_fps}`, Standard 200 Frames/s, maximal 1000. Beim Trennen endet das Abo.
 - Trace, Bus-Status, CPU-Info, Log-Spiegel und Berry-`print` werden bei vollem BLE-Puffer verworfen, statt die Firmware zu blockieren.
 - Antworten auf Befehle gehen nie verloren.
+- Trace wird gebündelt: höchstens 40 Notifies/s, je Notify so viele Frames wie in MTU−3 Bytes passen (alle 25 ms oder wenn voll).
+  - Standard: alte `{"type":"trace",…}`-Frames hintereinander in einem Notify (alte Web-UI versteht das).
+  - `trace.start {…, batch:true}`: kompakt `{"type":"trace_batch","f":[[bus,id,ts,"HEX"],…]}`, etwa 18 statt 7 Frames pro Notify. Die neue Web-UI fragt das an.
+- Gesendet wird nur, wenn genug NimBLE-Puffer (msys) und mindestens 24 KB interner RAM frei sind. Sonst warten die Frames in einem Ring (128). Läuft der Ring über, fallen die ältesten weg.
+- `trace.stop` liefert `sent`, `notifies`, `rate_dropped` (max_fps), `ble_dropped` (Ring/BLE voll), `push_dropped` und `dropped` (alter Name für `rate_dropped`).
+- Heartbeat (Debug an) zeigt `iram`/`iram_min` und eine Zeile `trace=… sent=… rate_drop=… ble_drop=… | ble ntf ok=… enomem=… msys_free=…`.
 
 ## Safe Mode und USB-Konsole
 

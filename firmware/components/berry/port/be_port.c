@@ -127,3 +127,24 @@ size_t be_fsize(void *hfile)
     (void)hfile;
     return 0;
 }
+
+#if defined(ESP_PLATFORM) && defined(CONFIG_SPIRAM)
+#include "esp_heap_caps.h"
+
+void *be_port_malloc(size_t size)
+{
+    return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                                   MALLOC_CAP_DEFAULT);
+}
+
+void be_port_free(void *ptr)
+{
+    heap_caps_free(ptr);
+}
+
+void *be_port_realloc(void *ptr, size_t size)
+{
+    return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
+                                    MALLOC_CAP_DEFAULT);
+}
+#endif

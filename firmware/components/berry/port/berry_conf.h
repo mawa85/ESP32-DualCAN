@@ -70,12 +70,30 @@
 #define BE_USE_INTROSPECT_MODULE        0
 #define BE_USE_STRICT_MODULE            0
 
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
+
 /* libc hooks — newlib-nano on ESP-IDF provides these. */
 #define BE_EXPLICIT_ABORT               abort
 #define BE_EXPLICIT_EXIT                exit
+#if defined(ESP_PLATFORM) && defined(CONFIG_SPIRAM)
+/* On PSRAM boards keep the Berry heap out of internal RAM: with
+ * SPIRAM_MALLOC_ALWAYSINTERNAL every small GC object used to land in
+ * internal DRAM, the same pool the BT controller allocates from at runtime.
+ * be_port.c falls back to internal RAM when PSRAM is exhausted. */
+#include <stddef.h>
+void *be_port_malloc(size_t size);
+void  be_port_free(void *ptr);
+void *be_port_realloc(void *ptr, size_t size);
+#define BE_EXPLICIT_MALLOC              be_port_malloc
+#define BE_EXPLICIT_FREE                be_port_free
+#define BE_EXPLICIT_REALLOC             be_port_realloc
+#else
 #define BE_EXPLICIT_MALLOC              malloc
 #define BE_EXPLICIT_FREE                free
 #define BE_EXPLICIT_REALLOC             realloc
+#endif
 
 #define be_assert(expr)                 assert(expr)
 

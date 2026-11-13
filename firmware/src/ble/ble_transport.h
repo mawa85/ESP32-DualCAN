@@ -23,6 +23,19 @@ bool dorky_ble_tx_ready(void);
 /* Free NimBLE msys buffers (rough back-pressure signal for droppable pushes). */
 int dorky_ble_free_bufs(void);
 
+/* Optional traffic (trace, status, log mirror) may send `chunks` notifies
+ * now: connected+subscribed, enough msys buffers left above a reserve, and
+ * enough internal RAM left for the BT controller. */
+#define DORKY_BLE_MSYS_RESERVE      8
+#define DORKY_BLE_INTERNAL_RESERVE  (24 * 1024)
+bool dorky_ble_tx_credit(int chunks);
+
+typedef struct {
+    uint32_t ok, enomem, err, tx_events;
+    int msys_free;
+} dorky_ble_tx_stats_t;
+void dorky_ble_tx_stats(dorky_ble_tx_stats_t *out);
+
 /* Returns the negotiated ATT MTU for the active connection, or 0 if disconnected. */
 uint16_t dorky_ble_mtu(void);
 
