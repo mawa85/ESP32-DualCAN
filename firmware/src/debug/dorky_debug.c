@@ -16,6 +16,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "storage/state.h"
+#include "sdkconfig.h"
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#endif
 
 static const char *TAG = "debug";
 
@@ -24,6 +29,10 @@ static const char *TAG = "debug";
 
 static bool s_enabled;
 static bool s_stdin_nb;
+static bool s_usj_driver;
+static dorky_console_hook_t s_console_hook;
+
+void dorky_debug_set_console_hook(dorky_console_hook_t hook) { s_console_hook = hook; }
 
 static const char *reset_reason_str(esp_reset_reason_t r)
 {
@@ -111,6 +120,29 @@ void dorky_debug_init(void)
 
 void dorky_debug_console_init(void)
 {
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    /* Without the driver, the IDF USB-Serial-JTAG VFS is TX-only in practice:
+     * the non-driver read path never drains the RX FIFO, so a host writing to
+     * COMx just times out. Install the driver (ISR lands on the calling core,
+     * i.e. the app core) and route the VFS through it. TX stays safe without a
+     * host attached: the VFS blocks at most once for 50 ms, then drops. */
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t cfg = {
+            .tx_buffer_size = 1024,
+            .rx_buffer_size = 256,
+        };
+        if (usb_serial_jtag_driver_install(&cfg) == ESP_OK) {
+            usb_serial_jtag_vfs_use_driver();
+            s_usj_driver = true;
+        }
+    } else {
+        s_usj_driver = true;
+    }
+    if (s_usj_driver) {
+        ESP_LOGI(TAG, "console: USB-Serial-JTAG input ready (type 'help')");
+        return;
+    }
+#endif
     int fd = fileno(stdin);
     if (fd < 0) return;
     int flags = fcntl(fd, F_GETFL, 0);
@@ -194,7 +226,7 @@ static void handle_console_line(char *line)
     if (n == 0) return;
 
     /* lowercase the command word in place for matching */
-    char cmd[48];
+    char cmd[96];
     size_t cpy = n < sizeof(cmd) - 1 ? n : sizeof(cmd) - 1;
     memcpy(cmd, line, cpy);
     cmd[cpy] = '\0';
@@ -214,34 +246,42 @@ static void handle_console_line(char *line)
         printf("debug %s\n", s_enabled ? "ON" : "OFF");
     } else if (strcmp(cmd, "help") == 0 || strcmp(cmd, "debug help") == 0) {
         printf("commands: debug on | debug off | debug status\n");
+        if (s_console_hook) s_console_hook(line, "help");
+    } else if (s_console_hook && s_console_hook(line, cmd)) {
+        /* handled by the app hook */
     } else {
-        printf("unknown command: %s  (try: debug on | debug off | debug status)\n", line);
+        printf("unknown command: %s  (try: help)\n", line);
     }
+}
+
+static int console_read_byte(char *c)
+{
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    if (s_usj_driver) return usb_serial_jtag_read_bytes(c, 1, 0) == 1 ? 1 : 0;
+#endif
+    if (!s_stdin_nb) return -1;
+    int fd = fileno(stdin);
+    if (fd < 0) return -1;
+    ssize_t r = read(fd, c, 1);
+    if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+    return r > 0 ? 1 : 0;
 }
 
 void dorky_debug_console_poll(void)
 {
-    static char buf[64];
+    static char buf[96];
     static size_t len;
-    if (!s_stdin_nb) return;
-    int fd = fileno(stdin);
-    if (fd < 0) return;
-
     char c;
-    while (1) {
-        ssize_t r = read(fd, &c, 1);
-        if (r <= 0) {
-            if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
-                return;
-            break;
-        }
-        if (c == '\r') continue;
-        if (c == '\n') {
+    for (int guard = 0; guard < 256; guard++) {
+        if (console_read_byte(&c) <= 0) break;
+        if (c == '\r' || c == '\n') {
+            if (len == 0) continue;
             buf[len] = '\0';
             handle_console_line(buf);
             len = 0;
             continue;
         }
+        if (c == 0x08 || c == 0x7f) { if (len) len--; continue; }
         if (len + 1 < sizeof(buf)) buf[len++] = c;
         else len = 0; /* overflow: drop the line */
     }

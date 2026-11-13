@@ -6,15 +6,18 @@
 # Die 120-Ohm-Abschluesse RZ1/RZ2 sind fest verbaut -> zusammen ~60 Ohm.
 # Bus 0 sendet, Bus 1 empfaengt und zaehlt. Doku: docs/simulator.md
 #
-# Quellen fuer IDs/Bits (alle Intel/little-endian):
-#   VEH = dbc/Model3_VEH.dbc in diesem Repo (Tesla Model 3/Y Vehicle-Bus)
-#   JW  = joshwardell/model3dbc Model3CAN.dbc (GenMsgCycleTime = Sendeperiode)
-#   OP  = commaai/opendbc tesla_model3_party.dbc (gleiche Layouts 0x118/0x129/0x257/0x39D)
+# DBC: Signale per Namen (can_msg_new / msg_sig_set / msg_sig_get) aus
+#   dbc/Model3_VEH.dbc (Bus 0 = Vehicle-CAN, mit Model3_CH.dbc wie in der Web-UI).
+#   Die Namen werden beim Hochladen zu Bitpositionen aufgeloest (.bep):
+#   Web-UI "Save" oder tools/upload_script.py (nutzt denselben Preprocessor).
+#   Gegenprobe: joshwardell/model3dbc, commaai/opendbc tesla_model3_party/vehicle.
+#   Juniper (Model Y 2025+): IDs/Layouts aus Model 3/Y uebernommen, nicht am
+#   Juniper verifiziert -> docs/simulator.md, Abschnitt "DBC / Juniper".
 # Checksumme (Byte 0): (ID_lo + ID_hi + Summe Bytes 1..7) & 0xFF, wie
 #   firmware/src/can/tesla.c bzw. opendbc tesla checksum.
 #
-# Nur Firmware-APIs: can_send_raw, can_recv_raw, timer_every, timer_cancel,
-# action_register, millis, print, format, str, int, bytes.setbits.
+# Ohne Preprocessing (Rohdatei auf dem Geraet) laeuft das Skript NICHT:
+# msg_sig_set braucht dann numerische Argumente.
 
 # ---------------- Konfiguration ----------------
 var mys_cfg = {
@@ -126,14 +129,26 @@ class MYSim
   end
 
   # ---------- Frame-Hilfen ----------
-  def finish(id, b)
+  # Signale werden per Namen aus der DBC gesetzt (msg_sig_set). Der Web-UI-
+  # Preprocessor bzw. tools/upload_script.py loest die Namen beim Hochladen
+  # gegen dbc/Model3_VEH.dbc (+ Model3_CH.dbc) in Startbit/Laenge/Faktor auf
+  # (.bep). Auf dem Geraet gibt es keine DBC-Laufzeitabhaengigkeit.
+  def next_ctr(id)
     var c = self.cnt[id]
-    b.setbits(8, 4, c)                         # Counter Bit 8|4 (VEH/OP)
     self.cnt[id] = (c + 1) % 16
+    return c
+  end
+
+  # Tesla-Checksumme Byte 0: (ID_lo + ID_hi + Summe Bytes 1..7) & 0xFF
+  # (firmware/src/can/tesla.c, opendbc tesla checksum). Steht nicht in der DBC.
+  def checksum(m)
+    var d = m['data']
+    var id = m['id']
     var s = (id & 0xFF) + ((id >> 8) & 0xFF)
-    for i: 1..7 s += b[i] end
-    b[0] = s & 0xFF                             # Checksumme Byte 0
-    return b
+    var n = size(d) - 1
+    for i: 1..n s += d[i] end
+    d[0] = s & 0xFF
+    return m
   end
 
   def blink_phase()   # Blinker-Takt ~1.5 Hz: 2 = ACTIVE_HIGH, 1 = ACTIVE_LOW (VEH VAL_)
@@ -141,84 +156,93 @@ class MYSim
   end
 
   def build(id)
-    var b = bytes(-8)
     if id == 0x118
-      # VEH/OP DI_systemStatus: immobilizer 13|3=3 DISARMED, systemState 16|3 (2 STANDBY, 5 ENABLE),
-      # brakePedalState 19|2, gear 21|3 (1 P,2 R,3 N,4 D), hvil 27|2=2 CLOSED,
-      # accelPedalPos 32|8 x0.4 %, vehicleAcceleration 52|12 signed x0.01 m/s2
-      b.setbits(13, 3, 3)
-      b.setbits(16, 3, self.gear == 1 ? 2 : 5)
-      b.setbits(19, 2, self.brake ? 1 : 0)
-      b.setbits(21, 3, self.gear)
-      b.setbits(27, 2, 2)
-      b.setbits(32, 8, int(self.pedal * 2.5))
-      b.setbits(52, 12, int(self.acc * 100) & 0xFFF)
-      return self.finish(id, b)
+      var ss = can_msg_new("DI_systemStatus")
+      msg_sig_set(ss, "DI_immobilizerState", 3)          # DISARMED
+      msg_sig_set(ss, "DI_systemState", self.gear == 1 ? 2 : 5)   # STANDBY / ENABLE
+      msg_sig_set(ss, "DI_brakePedalState", self.brake ? 1 : 0)
+      msg_sig_set(ss, "DI_gear", self.gear)              # 1 P, 2 R, 3 N, 4 D
+      msg_sig_set(ss, "DI_hvilSystemStatus", 2)          # CLOSED
+      msg_sig_set(ss, "DI_accelPedalPos", self.pedal)    # %
+      msg_sig_set(ss, "DI_vehicleAcceleration", self.acc)   # m/s2, signed
+      msg_sig_set(ss, "DI_systemStatusCounter", self.next_ctr(id))
+      return self.checksum(ss)
     elif id == 0x129
-      # VEH/OP SCCM_steeringAngleSensor: status 14|2=0 OK, angle 16|14 (0.1,-819.2) deg,
-      # validity 30|2=1 VALID, angleSpeed 32|14 (0.5,-4096) deg/s.
-      # Byte 0 heisst hier "Crc" - Algorithmus unbestaetigt, wir nutzen die Summen-Checksumme.
-      b.setbits(16, 14, int((self.steer + 819.2) * 10))
-      b.setbits(30, 2, 1)
-      b.setbits(32, 14, int((self.steer_rate + 4096) * 2))
-      return self.finish(id, b)
+      var sa = can_msg_new("SCCM_steeringAngleSensor")
+      msg_sig_set(sa, "SCCM_steeringAngleSensorStatus", 0)   # OK
+      msg_sig_set(sa, "SCCM_steeringAngle", self.steer)       # Grad
+      msg_sig_set(sa, "SCCM_steeringAngleValidity", 1)       # VALID
+      msg_sig_set(sa, "SCCM_steeringAngleSpeed", self.steer_rate)
+      msg_sig_set(sa, "SCCM_steeringAngleCounter", self.next_ctr(id))
+      # Byte 0 heisst hier "Crc" - Algorithmus unbestaetigt, Summen-Checksumme
+      return self.checksum(sa)
     elif id == 0x257
-      # VEH DI_speed: vehicleSpeed 43|13 (0.08,-40) km/h, uiSpeed 24|9 km/h, units 33|1=1 KPH,
-      # accelPedalPressed 34|1, velocityEstimatorState 56|3=1.
-      # Bit 12|12 (0.08,-40): VEH "opdVehicleModelSpeedRef", in JW/aelteren DBCs "DI_vehicleSpeed" -> gleicher Wert.
-      var raw = int((self.v + 40) * 12.5)
-      b.setbits(12, 12, raw)
-      b.setbits(24, 9, int(self.v + 0.5))
-      b.setbits(33, 1, 1)
-      b.setbits(34, 1, self.pedal > 0 ? 1 : 0)
-      b.setbits(43, 13, raw)
-      b.setbits(56, 3, 1)
-      return self.finish(id, b)
+      var sp = can_msg_new("DI_speed")
+      msg_sig_set(sp, "DI_vehicleSpeed", self.v)              # 43|13 (VEH/joshwardell)
+      msg_sig_set(sp, "DI_opdVehicleModelSpeedRef", self.v)   # 12|12 = opendbc "DI_vehicleSpeed"
+      msg_sig_set(sp, "DI_uiSpeed", int(self.v + 0.5))
+      msg_sig_set(sp, "DI_uiSpeedUnits", 1)                   # KPH
+      msg_sig_set(sp, "DI_accelPedalPressed", self.pedal > 0 ? 1 : 0)
+      msg_sig_set(sp, "DI_velocityEstimatorState", 1)
+      msg_sig_set(sp, "DI_speedCounter", self.next_ctr(id))
+      return self.checksum(sp)
     elif id == 0x39D
-      # VEH/OP IBST_status: iBoosterStatus 12|3 (5 READY, 6 ACTUATION), driverBrakeApply 16|2
-      # (1 NOT_APPLIED, 2 APPLYING), sInputRodDriver 21|12 (0.015625,-5) mm
-      b.setbits(12, 3, self.brake ? 6 : 5)
-      b.setbits(16, 2, self.brake ? 2 : 1)
-      b.setbits(21, 12, int(((self.brake ? 12.0 : 0.0) + 5) * 64))
-      return self.finish(id, b)
+      var ib = can_msg_new("IBST_status")
+      msg_sig_set(ib, "IBST_iBoosterStatus", self.brake ? 6 : 5)    # ACTUATION / READY
+      msg_sig_set(ib, "IBST_driverBrakeApply", self.brake ? 2 : 1)  # APPLYING / NOT_APPLIED
+      msg_sig_set(ib, "IBST_sInputRodDriver", self.brake ? 12.0 : 0.0)   # mm
+      msg_sig_set(ib, "IBST_statusCounter", self.next_ctr(id))
+      return self.checksum(ib)
     elif id == 0x292
-      # VEH BMS_socStatus: socMin 0|10, socUI 10|10, socMax 20|10, socAvg 30|10 (x0.1 %),
-      # enoughEnergyForConvenienceFeatures 40|1. Kein Counter/Checksumme.
-      var s = int(self.soc * 10)
-      b.setbits(0, 10, s - 5)
-      b.setbits(10, 10, s)
-      b.setbits(20, 10, s + 5)
-      b.setbits(30, 10, s)
-      b.setbits(40, 1, 1)
-      return b
+      var bm = can_msg_new("BMS_socStatus")                   # kein Counter/Checksumme
+      msg_sig_set(bm, "BMS_socMin", self.soc - 0.5)
+      msg_sig_set(bm, "BMS_socUI", self.soc)
+      msg_sig_set(bm, "BMS_socMax", self.soc + 0.5)
+      msg_sig_set(bm, "BMS_socAvg", self.soc)
+      msg_sig_set(bm, "BMS_enoughEnergyForConvenienceFeatures", 1)
+      return bm
     elif id == 0x3F5
-      # VEH VCFRONT_lighting: indicatorLeftRequest 0|2, indicatorRightRequest 2|2,
-      # hazardLightRequest 4|4=0, lightingCoreState 32|4 (2 DRL), turnIndicatorStalk 40|2,
-      # indicatorLeft/RightInternal 50|2 / 52|2. Kein Counter.
       var ph = self.blink_phase()
       var l = self.blink_l ? ph : 0
       var r = self.blink_r ? ph : 0
-      b.setbits(0, 2, l)
-      b.setbits(2, 2, r)
-      b.setbits(32, 4, self.gear == 1 ? 1 : 2)
-      b.setbits(40, 2, self.blink_l ? 1 : (self.blink_r ? 2 : 0))
-      b.setbits(50, 2, l)
-      b.setbits(52, 2, r)
-      return b
-    elif id == 0x102 || id == 0x103
-      # VEH VCLEFT/VCRIGHT_doorStatus: doorClosureStatusFront 0|4, Rear 4|4 (1 OPENED, 2 CLOSED),
-      # frontLatchStatus 14|4, rearLatchStatus 18|4 (1 OPENED, 2 CLOSED),
-      # 0x103 zusaetzlich trunkLatchStatus 56|4.
-      var f = id == 0x102 ? self.door_fl : self.door_fr
-      var r = id == 0x102 ? self.door_rl : self.door_rr
-      b.setbits(0, 4, f ? 1 : 2)
-      b.setbits(4, 4, r ? 1 : 2)
-      b.setbits(14, 4, f ? 1 : 2)
-      b.setbits(18, 4, r ? 1 : 2)
-      if id == 0x103 b.setbits(56, 4, self.trunk ? 1 : 2) end
-      return b
+      var li = can_msg_new("VCFRONT_lighting")                # kein Counter
+      msg_sig_set(li, "VCFRONT_indicatorLeftRequest", l)
+      msg_sig_set(li, "VCFRONT_indicatorRightRequest", r)
+      msg_sig_set(li, "VCFRONT_lightingCoreState", self.gear == 1 ? 1 : 2)
+      msg_sig_set(li, "VCFRONT_turnIndicatorStalk", self.blink_l ? 1 : (self.blink_r ? 2 : 0))
+      msg_sig_set(li, "VCFRONT_indicatorLeftInternal", l)
+      msg_sig_set(li, "VCFRONT_indicatorRightInternal", r)
+      return li
+    elif id == 0x102
+      var dl = can_msg_new("VCLEFT_doorStatus")               # 1 OPENED, 2 CLOSED
+      msg_sig_set(dl, "VCLEFT_doorClosureStatusFront", self.door_fl ? 1 : 2)
+      msg_sig_set(dl, "VCLEFT_doorClosureStatusRear", self.door_rl ? 1 : 2)
+      msg_sig_set(dl, "VCLEFT_frontLatchStatus", self.door_fl ? 1 : 2)
+      msg_sig_set(dl, "VCLEFT_rearLatchStatus", self.door_rl ? 1 : 2)
+      return dl
+    elif id == 0x103
+      var dr = can_msg_new("VCRIGHT_doorStatus")
+      msg_sig_set(dr, "VCRIGHT_doorClosureStatusFront", self.door_fr ? 1 : 2)
+      msg_sig_set(dr, "VCRIGHT_doorClosureStatusRear", self.door_rr ? 1 : 2)
+      msg_sig_set(dr, "VCRIGHT_frontLatchStatus", self.door_fr ? 1 : 2)
+      msg_sig_set(dr, "VCRIGHT_rearLatchStatus", self.door_rr ? 1 : 2)
+      msg_sig_set(dr, "VCRIGHT_trunkLatchStatus", self.trunk ? 1 : 2)
+      return dr
     end
     return nil
+  end
+
+  # Empfangsseite per Signal dekodieren (gleiche DBC) - fuer den Report.
+  def rx_decode()
+    if self.rx < 0 return '' end
+    var sp = can_msg_get(self.rx, "DI_speed")
+    var ss = can_msg_get(self.rx, "DI_systemStatus")
+    var bm = can_msg_get(self.rx, "BMS_socStatus")
+    var out = ' | rx-dekodiert:'
+    if sp != nil out += format(' v=%.1f', msg_sig_get(sp, "DI_vehicleSpeed")) end
+    if ss != nil out += ' gear=' .. 'xPRND'[int(msg_sig_get(ss, "DI_gear")) % 5] end
+    if bm != nil out += format(' soc=%.1f', msg_sig_get(bm, "BMS_socUI")) end
+    return out
   end
 
   # ---------- Empfangspruefung ----------
@@ -268,7 +292,7 @@ class MYSim
     end
     var ph = mys_phases[self.phase][0]
     print(format('SIM %s v=%.0f gear=%s soc=%.1f | tx=%d rx=%d', ph, self.v,
-          'xPRND'[self.gear], self.soc, tot_tx, tot_rx))
+          'xPRND'[self.gear], self.soc, tot_tx, tot_rx) .. self.rx_decode())
     if self.rx >= 0
       print('SIM rx/tx (Counter-IDs) bzw. ok' .. line)
       if size(lossy) > 0 && size(miss) == 0
@@ -317,11 +341,11 @@ class MYSim
     for m: mys_msgs
       var per = self.throttled ? 1000 : m[1]
       if ms % per == 0
-        var b = self.build(m[0])
-        if b != nil
-          can_send_raw(self.tx, m[0], b)
+        var msg = self.build(m[0])
+        if msg != nil
+          can_msg_send(self.tx, msg)
           self.txc[m[0]] += 1
-          self.txlast[m[0]] = b
+          self.txlast[m[0]] = msg['data']
         end
       end
     end

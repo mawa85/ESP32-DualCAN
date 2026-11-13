@@ -6,6 +6,6 @@ FILE(GLOB_RECURSE app_sources
 idf_component_register(
     SRCS ${app_sources}
     INCLUDE_DIRS "."
-    REQUIRES driver esp_driver_twai esp_driver_gpio esp_driver_spi acan2517fd berry led_strip littlefs esp_partition vfs bt json
+    REQUIRES driver esp_driver_usb_serial_jtag esp_driver_twai esp_driver_gpio esp_driver_spi acan2517fd berry led_strip littlefs esp_partition vfs bt json
              esp_wifi esp_event esp_netif nvs_flash app_update mbedtls tesla-ble esp_http_server
 )

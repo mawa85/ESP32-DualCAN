@@ -7,8 +7,11 @@ Dateien:
 
 | Datei | Zweck |
 |---|---|
-| `firmware/test_scripts/model_y_sim.be` | Berry-Skript (Sender + Empfangsprüfung) |
-| `tools/upload_script.py` | Hochladen/Starten/Stoppen per BLE vom PC aus (bleak) |
+| `firmware/test_scripts/model_y_sim.be` | Berry-Skript (Sender + Empfangsprüfung), Signale per DBC-Namen |
+| `firmware/test_scripts/model_y_sim.bep` | Dasselbe, mit der DBC vorverarbeitet (das läuft auf dem Gerät) |
+| `tools/upload_script.py` | Hochladen (.be + .bep), Filter setzen, Starten/Stoppen per BLE (bleak) |
+| `tools/dbc_prep/preprocess.ts` | Vorverarbeitung .be → .bep mit dem Web-UI-Preprocessor (Node.js) |
+| `tools/can_filters.json` | RX-Filterprofile `bench`, `juniper`, `none` |
 | `tools/sim_host/` | Host-Test: echte Berry-VM und Firmware-Bindings, CAN-Treiber als Schleife |
 
 ## Verdrahtung
@@ -53,11 +56,14 @@ Schraubklemme mit 12 V versorgen.
 
 ```
 pip install bleak
-python tools/upload_script.py firmware/test_scripts/model_y_sim.be --log 120
+python tools/upload_script.py firmware/test_scripts/model_y_sim.be --filters bench --log 120
 ```
 
-Das Skript lädt die Datei per `script.write` hoch, aktiviert sie per `script.enable` und zeigt
-120 s lang das Log. Das Skript läuft sofort und startet nach jedem Reboot automatisch, sobald
+Das Skript setzt die RX-Filter (`bus.set_filter`), lädt Quelltext und `.bep` in einem
+`script.write` hoch, aktiviert per `script.enable` und zeigt 120 s lang das Log. Liegt
+`model_y_sim.bep` neben der `.be`, braucht der PC kein Node.js. Antwortet `script.enable`
+nicht innerhalb von 30 s, fragt das Tool `script.list` ab und meldet „aktiviert“, wenn das
+Skript läuft. Bei Verbindungsfehlern (GATT-Timeout) versucht es 3-mal neu. Das Skript läuft sofort und startet nach jedem Reboot automatisch, sobald
 der Bus lebt oder spätestens nach 5 s.
 
 - Stoppen, ohne Autostart: `python tools/upload_script.py --stop model_y_sim.be`
@@ -65,8 +71,9 @@ der Bus lebt oder spätestens nach 5 s.
 - Nur das Log mitschneiden: `python tools/upload_script.py --log 300`
 - Übersicht: `python tools/upload_script.py --list`
 
-**Über die Web-UI:** Automations / Scripts, neues Skript `model_y_sim.be` anlegen, den Inhalt
-einfügen, speichern und einschalten. Es braucht keine DBC. Auf der Events-Seite erscheinen
+**Über die Web-UI:** Fahrzeug „Tesla Model Y“ wählen (lädt die DBCs), Automations / Scripts,
+neues Skript `model_y_sim.be` anlegen, den Inhalt einfügen, speichern (der Preprocessor löst
+die Signalnamen auf) und einschalten. Ohne geladene DBC lässt sich das Skript nicht speichern. Auf der Events-Seite erscheinen
 zwei Kacheln: „Sim Start/Stop“ (Pause) und „Sim Report“.
 
 ## Einstellungen
@@ -132,7 +139,7 @@ SIM alle 8 IDs empfangen
 
 ```
 FW=firmware tools/sim_host/build.sh
-mkdir -p /tmp/s/berry_test_scripts && cp firmware/test_scripts/model_y_sim.be /tmp/s/berry_test_scripts/
+mkdir -p /tmp/s/berry_test_scripts && cp firmware/test_scripts/model_y_sim.be* /tmp/s/berry_test_scripts/
 cd /tmp/s && SIM_DUMP=/tmp/frames.txt <repo>/tools/sim_host/run_sim 60 22 41   # 60 s, Kabel ab bei 22 s, dran bei 41 s
 python3 <repo>/tools/sim_host/decode_check.py <repo>/dbc/Model3_VEH.dbc /tmp/frames.txt   # pip install cantools
 ```
@@ -140,3 +147,75 @@ python3 <repo>/tools/sim_host/decode_check.py <repo>/dbc/Model3_VEH.dbc /tmp/fra
 Der Host-Test nutzt die echte Berry-VM und die echten Dateien `berry_bindings.c`,
 `berry_registry.c`, `script_loader.c`, `can.c` und `rate_limit.c`. Nur der CAN-Treiber ist
 ersetzt: TX auf Bus 0 landet als RX auf Bus 1.
+
+`.bep` neu erzeugen, nachdem die `.be` geändert wurde:
+
+```
+node tools/dbc_prep/preprocess.ts firmware/test_scripts/model_y_sim.be \
+     firmware/test_scripts/model_y_sim.bep dbc/Model3_VEH.dbc dbc/Model3_CH.dbc
+```
+
+## DBC und Model Y Juniper
+
+Die Firmware hat keine DBC an Bord. Wie in der Web-UI werden Nachrichten- und Signalnamen
+beim Speichern gegen die DBC je Bus in Startbit, Länge, Faktor und Offset übersetzt (`.bep`).
+Verwendet werden die mitgelieferten Tesla-DBCs: `dbc/Model3_VEH.dbc` (Bus 0, Vehicle-CAN) und
+`dbc/Model3_CH.dbc` (Bus 1). Gegengeprüft wurde mit joshwardell/model3dbc und
+commaai/opendbc (`tesla_model3_vehicle.dbc`, `tesla_model3_party.dbc`).
+
+| Punkt | Stand |
+|---|---|
+| Busse am rechten A-Säulen-Port, Juniper ab SOP10 (Berlin ab 01.04.2026) | Party-, Vehicle- und Body-CAN. Chassis-CAN liegt am neuen linken Port X177 (Tesla-Schaltplan, Community-Bericht) |
+| CAN-B im Auto | daher Party-CAN statt Chassis-CAN. Für Bus 1 passt dann `Model3_PARTY.dbc` bzw. opendbc `tesla_model3_party.dbc` |
+| IDs 0x118, 0x129, 0x257, 0x39D, 0x292, 0x3F5, 0x102, 0x103 | aus Model 3/Y übernommen, **am Juniper nicht verifiziert** |
+| `DI_speed` 0x257 | DBCs unterscheiden sich: VEH `DI_vehicleSpeed` 43\|13, opendbc 12\|12 (VEH-Name `DI_opdVehicleModelSpeedRef`). Der Simulator setzt beide. `DI_uiSpeedUnits` VEH 33\|1, opendbc 32\|1 |
+| `IBST_status` 0x39D | VEH 8 Byte, opendbc Party 5 Byte |
+| Checksumme Byte 0, Counter 8\|4 | Model 3/Y-Verfahren (`tesla.c`), am Juniper nicht verifiziert |
+
+Vor der ersten Fahrt mit eigenen Skripten: 1–2 Minuten mit `trace.start` (Web-UI Trace)
+mitschneiden und die Werte gegen das Kombiinstrument prüfen.
+
+## RX-Filter
+
+Nur die benötigten IDs werden an Skripte und an das BLE-Streaming weitergegeben.
+`bus.set_filter {bus, ids}` speichert die Liste in NVS (`busconfig/f0`, `f1`) und gilt sofort.
+
+- CAN-A (MCP2518FD): bis 32 IDs exakt als Hardware-Filter.
+- CAN-B (TWAI): eine Sammelmaske in Hardware, der Rest wird in Software verworfen.
+- Bus-Gesundheit und RX-Rate zählen weiter alle angenommenen Frames.
+- Senden wird nie gefiltert.
+
+| Profil | Bus 0 (Vehicle) | Bus 1 |
+|---|---|---|
+| `bench` | wie `juniper` | die 8 Simulator-IDs |
+| `juniper` | 102 103 118 129 257 273 292 294 2C2 2C3 2E1 313 334 39B 39D 3E9 3F5 | Party: 118 129 145 257 2B9 311 39D |
+| `none` | alles | alles |
+
+Konsole: `filter` zeigt die aktiven Listen.
+
+## BLE-Streaming
+
+- Notifies gehen erst raus, wenn der PC/Browser TX abonniert hat, spätestens 2,5 s nach dem Verbinden. Die Service-Discovery hat so die BLE-Puffer für sich.
+- Trace nur auf Abo: `trace.start {buses, ids, max_fps}`, Standard 200 Frames/s, maximal 1000. Beim Trennen endet das Abo.
+- Trace, Bus-Status, CPU-Info, Log-Spiegel und Berry-`print` werden bei vollem BLE-Puffer verworfen, statt die Firmware zu blockieren.
+- Antworten auf Befehle gehen nie verloren.
+
+## Safe Mode und USB-Konsole
+
+**Safe Mode:** Board einschalten oder RESET drücken, **danach** BOOT drücken und gedrückt
+halten, mindestens 0,5 s innerhalb der ersten 3 s. Persistente Skripte starten dann nicht.
+BLE und Web-UI laufen normal. Im Log steht `SAFE MODE`. BOOT nicht schon beim Reset halten:
+dann startet der ROM-Download-Modus.
+
+**Konsole** (USB, COMx, 115200; z. B. `pio device monitor` oder PuTTY), Befehl + Enter:
+
+| Befehl | Wirkung |
+|---|---|
+| `help` | Befehle anzeigen |
+| `scripts` | Skripte und Status |
+| `script stop all` | alle Skripte stoppen; Autostart bleibt für den nächsten Boot |
+| `script stop <datei>` / `script start <datei>` | einzeln, wird gespeichert |
+| `safe` | alle stoppen **und** Autostart leeren |
+| `filter` | aktive RX-Filter |
+| `debug on` / `debug off` / `debug status` | Debug-Log |
+| `reboot` | Neustart |

@@ -17,6 +17,11 @@ int dorky_ble_notify(const uint8_t *data, size_t len);
 
 /* Returns true if a client is currently connected. */
 bool dorky_ble_connected(void);
+/* Connected AND the central enabled notifications on TX (or the 2.5 s
+ * post-connect grace period has passed). */
+bool dorky_ble_tx_ready(void);
+/* Free NimBLE msys buffers (rough back-pressure signal for droppable pushes). */
+int dorky_ble_free_bufs(void);
 
 /* Returns the negotiated ATT MTU for the active connection, or 0 if disconnected. */
 uint16_t dorky_ble_mtu(void);

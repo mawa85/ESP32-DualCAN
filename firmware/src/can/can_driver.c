@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <string.h>
 
+#include "can/can.h"
 #include "can/mcp2518fd.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -98,6 +99,30 @@ static twai_timing_config_t timing_for(uint32_t kbps)
     return t;
 }
 
+/* Coarse TWAI acceptance filter (single-filter mode) that passes every ID
+ * in the bus' can_filter list: code = first ID, mask = all bits in which
+ * the IDs differ. Frames that slip through are dropped by the exact
+ * software filter in can_poll(). Standard IDs only; any extended ID in the
+ * list falls back to accept-all. */
+static twai_filter_config_t twai_filter_for_bus(int bus_id)
+{
+    twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    uint32_t ids[CAN_FILTER_MAX_IDS];
+    int n = can_filter_get(bus_id, ids, CAN_FILTER_MAX_IDS);
+    if (n <= 0) return f;
+    uint32_t diff = 0;
+    for (int i = 0; i < n; i++) {
+        if (ids[i] > 0x7FF) return f;
+        diff |= ids[i] ^ ids[0];
+    }
+    f.acceptance_code = (ids[0] & 0x7FF) << 21;
+    f.acceptance_mask = ((diff & 0x7FF) << 21) | 0x001FFFFFu;
+    f.single_filter = true;
+    ESP_LOGI(TAG, "bus%d: TWAI hw filter code=0x%08" PRIx32 " mask=0x%08" PRIx32,
+             bus_id, f.acceptance_code, f.acceptance_mask);
+    return f;
+}
+
 esp_err_t can_bus_install(const can_bus_config_t *cfg)
 {
     if (!cfg || cfg->bus_id < 0 || cfg->bus_id >= CAN_BUS_COUNT) {
@@ -140,7 +165,7 @@ esp_err_t can_bus_install(const can_bus_config_t *cfg)
     gcfg.rx_queue_len = cfg->rx_queue_len ? cfg->rx_queue_len : 16;
 
     twai_timing_config_t tcfg = timing_for(cfg->bitrate_kbps);
-    twai_filter_config_t fcfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    twai_filter_config_t fcfg = twai_filter_for_bus(cfg->bus_id);
 
     esp_err_t err = twai_driver_install_v2(&gcfg, &tcfg, &fcfg,
                                            &s_buses[cfg->bus_id]);
@@ -175,6 +200,14 @@ uint32_t can_bus_get_bitrate(int bus_id)
 {
     if (bus_id < 0 || bus_id >= CAN_BUS_COUNT) return 0;
     return s_bitrates[bus_id];
+}
+
+esp_err_t can_bus_reapply_filter(int bus_id)
+{
+    if (bus_id < 0 || bus_id >= CAN_BUS_COUNT) return ESP_ERR_INVALID_ARG;
+    uint32_t kbps = s_bitrates[bus_id];
+    if (kbps == 0) return ESP_OK;   /* bus not installed: applied at install */
+    return can_bus_set_bitrate(bus_id, kbps);
 }
 
 esp_err_t can_bus_set_bitrate(int bus_id, uint32_t kbps)
@@ -226,7 +259,7 @@ esp_err_t can_bus_set_bitrate(int bus_id, uint32_t kbps)
     gcfg.rx_queue_len = s_configs[bus_id].rx_queue_len ? s_configs[bus_id].rx_queue_len : 16;
 
     twai_timing_config_t tcfg = timing_for(kbps);
-    twai_filter_config_t fcfg = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    twai_filter_config_t fcfg = twai_filter_for_bus(bus_id);
 
     err = twai_driver_install_v2(&gcfg, &tcfg, &fcfg, &s_buses[bus_id]);
     if (err != ESP_OK) {

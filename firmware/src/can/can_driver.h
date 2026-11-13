@@ -51,6 +51,10 @@ esp_err_t can_bus_receive(int bus_id, twai_message_t *out,
 esp_err_t can_bus_status(int bus_id, twai_status_info_t *out);
 
 uint32_t  can_bus_get_bitrate(int bus_id);
+/* Reinstall the controller so the hardware acceptance filter matches the
+ * current can_filter list (same path as a bitrate change). */
+esp_err_t can_bus_reapply_filter(int bus_id);
+
 esp_err_t can_bus_set_bitrate(int bus_id, uint32_t kbps);
 
 typedef enum {

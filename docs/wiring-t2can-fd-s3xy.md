@@ -22,6 +22,13 @@ The colored lines in the drawing are labels. They are not the jacket colors of a
 
 CAN-A is the MCP2518FD (Dorky bus 0, vehicle CAN). CAN-B is the ESP32-S3 TWAI (Dorky bus 1, chassis CAN). That matches `firmware/src/board/board_t2can_fd.h` (`BOARD_T2CAN_MCP_BUS`).
 
+> [!IMPORTANT]
+> **Model Y Juniper built from SOP10 on (Berlin from 2026-04-01, Austin 2025-12-04, Fremont 2025-12-09, Shanghai 2026-03-25):**
+> the right A-pillar diagnostic connector is the same part, but it carries **Party, Vehicle and Body CAN**.
+> The third pair moved from pins 13/14 to 4/5 and is Body CAN. **Chassis CAN moved to a new left-side port (X177)**.
+> Source: Tesla electrical reference as summarized in hypery11/flipper-tesla-fsd discussion #114, plus Service Mode → CAN Port on harness 1933903-XX.
+> Not verified on this car. On such a car, wire CAN-B to Party CAN, preprocess bus-1 scripts against `dbc/Model3_PARTY.dbc`, and check every pair with Service Mode or a trace before you transmit anything.
+
 The transceivers are Mornsun / Visom `TD501MCAN`. Pins are RXD, TXD, GND, VCC, CANG, CANL, CANH. There is no standby or enable pin. CANG is the isolated CAN-side ground. The schematic names the isolated side `SGND*` and the logic side `DGND*`, with a 1000 pF / 2 kV capacitor and a 1 MΩ resistor between them (`CY3`/`CY6`, `RY1`/`RY2`).
 
 ## Pin map

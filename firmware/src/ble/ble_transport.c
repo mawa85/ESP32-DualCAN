@@ -60,6 +60,22 @@ static uint16_t s_reject_handle = BLE_HS_CONN_HANDLE_NONE;
 /* Reason code used by the reject callout; default is auth fail. */
 static int s_reject_reason = BLE_ERR_AUTH_FAIL;
 static uint16_t s_tx_attr_handle;
+/* Set once the central has enabled notifications on the TX characteristic
+ * (CCCD write, or restored for a bonded peer). Before that, notifies would
+ * only compete with service discovery for the few ACL/mbuf buffers. */
+static volatile bool s_tx_subscribed;
+/* Fallback: some centrals (Windows with a cached CCCD on a bonded device)
+ * never rewrite the CCCD on reconnect. After this grace period notifies are
+ * allowed anyway; by then service discovery is normally done. */
+#define TX_SUBSCRIBE_GRACE_MS 2500
+static volatile uint32_t s_connect_ms;
+
+static bool tx_allowed(void)
+{
+    if (s_tx_subscribed) return true;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    return (now - s_connect_ms) >= TX_SUBSCRIBE_GRACE_MS;
+}
 static ble_request_cb_t s_on_request;
 static void *s_on_request_ctx;
 static bool s_pairing_open    = false;
@@ -351,6 +367,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                     ble_npl_callout_reset(&s_reject_callout, ble_npl_time_ms_to_ticks32(100));
                 }
                 s_conn_handle = new_h;
+                s_tx_subscribed = false;
+                s_connect_ms = (uint32_t)(esp_timer_get_time() / 1000);
                 if (!authorized) {
                     ESP_LOGI(TAG, "connected (handle=%d) — not bonded, rejecting in 2.5s", new_h);
                     s_conn_authorized = false;
@@ -439,6 +457,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                                        "disconnect mid-pairing");
             s_smp_inflight = false;
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            s_tx_subscribed = false;
             s_conn_authorized = false;
             /* If the connection ended without producing a bond and we still
              * have zero bonds, re-open the window so the user can retry
@@ -463,6 +482,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.conn_handle == s_conn_handle &&
+            event->subscribe.attr_handle == s_tx_attr_handle) {
+            s_tx_subscribed = event->subscribe.cur_notify != 0;
+        }
         ESP_LOGI(TAG, "subscribe: handle=%d attr=%d notify=%d indicate=%d",
                  event->subscribe.conn_handle,
                  event->subscribe.attr_handle,
@@ -603,6 +626,7 @@ int dorky_ble_init(ble_request_cb_t on_request, void *ctx)
 int dorky_ble_notify(const uint8_t *data, size_t len)
 {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return -1;
+    if (!tx_allowed()) return -1;
 
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
     if (!om) {
@@ -616,6 +640,16 @@ int dorky_ble_notify(const uint8_t *data, size_t len)
         ESP_LOGW(TAG, "notify failed rc=%d len=%u", rc, (unsigned)len);
     }
     return rc;
+}
+
+bool dorky_ble_tx_ready(void)
+{
+    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE && tx_allowed();
+}
+
+int dorky_ble_free_bufs(void)
+{
+    return os_msys_num_free();
 }
 
 bool dorky_ble_connected(void)

@@ -502,7 +502,10 @@ uint32_t ACAN2517FD::begin (const ACAN2517FDSettings & inSettings,
       }
     }
     #ifdef ARDUINO_ARCH_ESP32
-      xTaskCreate (myESP32Task, "ACAN2517Handler", 1024, this, 16, &mESP32TaskHandle) ;
+      // Dorky: pin the handler to the core that calls begin() (the app core,
+      // not the BLE core) and give it a real stack: the handler runs the SPI
+      // ISR core with interrupts masked, which must not starve NimBLE/BT on core 0.
+      xTaskCreatePinnedToCore (myESP32Task, "ACAN2517Handler", 3072, this, 16, &mESP32TaskHandle, xPortGetCoreID ()) ;
     #endif
     if (mINT != 255) { // 255 means interrupt is not used
       #ifdef ARDUINO_ARCH_ESP32

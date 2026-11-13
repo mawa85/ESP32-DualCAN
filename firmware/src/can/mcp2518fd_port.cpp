@@ -50,6 +50,10 @@ extern "C" bool mcp2518fd_is_up(int bus_id) { (void)bus_id; return false; }
 
 static const char *TAG = "mcp2518";
 
+/* From can/can.h (C header without extern "C" guard). */
+extern "C" int can_filter_get(int bus_id, uint32_t *ids, int max);
+#define MCP_HW_FILTER_MAX 32
+
 static SPIClass s_spi;
 static ACAN2517FD *s_can = nullptr;
 static can_bus_config_t s_cfg;
@@ -114,7 +118,28 @@ static esp_err_t start_controller(uint32_t kbps)
                  kbps, s_cfg.osc_hz);
         return ESP_ERR_INVALID_ARG;
     }
-    uint32_t err = s_can->begin(settings, mcp_isr);
+    /* Hardware acceptance filters: up to 32 exact standard IDs from the
+     * bus' can_filter list. More IDs (or an extended ID) -> pass-all, the
+     * software filter in can_poll() still applies. */
+    uint32_t ids[64];
+    int n = can_filter_get(s_cfg.bus_id, ids, 64);
+    bool exact = n > 0 && n <= MCP_HW_FILTER_MAX;
+    for (int i = 0; exact && i < n; i++) if (ids[i] > 0x7FF) exact = false;
+    uint32_t err;
+    if (exact) {
+        ACAN2517FDFilters filters;
+        for (int i = 0; i < n; i++) filters.appendFrameFilter(kStandard, ids[i], nullptr);
+        if (filters.filterStatus() != ACAN2517FDFilters::kFiltersOk) {
+            ESP_LOGW(TAG, "bus%d: filter list rejected (status %d), accepting all",
+                     s_cfg.bus_id, (int)filters.filterStatus());
+            err = s_can->begin(settings, mcp_isr);
+        } else {
+            err = s_can->begin(settings, mcp_isr, filters);
+            if (err == 0) ESP_LOGI(TAG, "bus%d: %d MCP2518FD hw filters active", s_cfg.bus_id, n);
+        }
+    } else {
+        err = s_can->begin(settings, mcp_isr);
+    }
     if (err != 0) {
         ESP_LOGE(TAG, "ACAN2517FD begin failed: 0x%08" PRIx32, err);
         s_can->end();
@@ -256,6 +281,13 @@ extern "C" esp_err_t mcp2518fd_set_bitrate(int bus_id, uint32_t kbps)
 extern "C" void mcp2518fd_bus_off_recover(int bus_id)
 {
     if (!s_up || !s_can || bus_id != s_cfg.bus_id) return;
+    /* This used to run every main-loop pass (1 ms): two SPI register reads,
+     * each with interrupts masked inside ACAN2517FD. Bus-off recovery only
+     * needs to react within ~1 s, so poll every 100 ms. */
+    static uint32_t s_last_check_ms = 0;
+    uint32_t now0 = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+    if ((now0 - s_last_check_ms) < 100) return;
+    s_last_check_ms = now0;
     uint32_t trec = s_can->errorCounters();
     bool txbo = (trec & (1u << 21)) != 0;
     ACAN2517FDSettings::OperationMode mode = s_can->currentOperationMode();

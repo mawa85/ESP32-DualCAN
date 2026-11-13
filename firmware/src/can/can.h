@@ -52,3 +52,17 @@ int  can_read(can_t *c, uint32_t msg_id, uint8_t *out_data, uint8_t *out_dlc, ui
 int  can_send(can_t *c, uint32_t id, const uint8_t *data, uint8_t dlc);
 
 void can_set_sim_mode(can_t *c, bool enabled);
+
+/* ---- RX acceptance filter (per bus) ----
+ * Empty list = accept everything (default). With a list, can_poll() still
+ * counts every frame for bus health / rx rate, but only listed IDs reach the
+ * trace observer (BLE streaming) and the script frame cache. can_driver uses
+ * the same list for the hardware filters: exact MCP2518FD filters (<= 32 IDs)
+ * and a coarse TWAI acceptance mask. TX is never filtered. */
+#define CAN_FILTER_MAX_IDS 64
+int  can_filter_set(int bus_id, const uint32_t *ids, int n);   /* n = 0: accept all */
+int  can_filter_get(int bus_id, uint32_t *ids, int max);        /* returns count */
+bool can_filter_allows(int bus_id, uint32_t id);
+/* Parse / format "118,257,3F5" (hex, no 0x needed). */
+int  can_filter_parse_csv(const char *csv, uint32_t *ids, int max);
+int  can_filter_format_csv(const uint32_t *ids, int n, char *out, int out_size);
