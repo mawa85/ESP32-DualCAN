@@ -20,8 +20,11 @@
  */
 #include "ble/ble_transport.h"
 
+#include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nimble/nimble_port.h"
@@ -34,6 +37,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "nimble/nimble_npl.h"
+#include "debug/dorky_debug.h"
 
 static const char *TAG = "ble";
 
@@ -58,6 +62,25 @@ static uint16_t s_reject_handle = BLE_HS_CONN_HANDLE_NONE;
 /* Reason code used by the reject callout; default is auth fail. */
 static int s_reject_reason = BLE_ERR_AUTH_FAIL;
 static uint16_t s_tx_attr_handle;
+/* Set once the central has enabled notifications on the TX characteristic
+ * (CCCD write, or restored for a bonded peer). Before that, notifies would
+ * only compete with service discovery for the few ACL/mbuf buffers. */
+static volatile bool s_tx_subscribed;
+static volatile uint32_t s_ntf_ok, s_ntf_enomem, s_ntf_err, s_ntf_tx_events;
+static uint32_t s_ntf_warn_ms;
+
+/* Fallback: some centrals (Windows with a cached CCCD on a bonded device)
+ * never rewrite the CCCD on reconnect. After this grace period notifies are
+ * allowed anyway; by then service discovery is normally done. */
+#define TX_SUBSCRIBE_GRACE_MS 2500
+static volatile uint32_t s_connect_ms;
+
+static bool tx_allowed(void)
+{
+    if (s_tx_subscribed) return true;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    return (now - s_connect_ms) >= TX_SUBSCRIBE_GRACE_MS;
+}
 static ble_request_cb_t s_on_request;
 static void *s_on_request_ctx;
 static bool s_pairing_open    = false;
@@ -69,6 +92,17 @@ static bool s_conn_authorized = false;
 #define KICK_COOLDOWN_MS 30000
 static ble_addr_t s_kicked_addr;
 static int64_t   s_kicked_until_ms = 0;
+
+/* Peers for which peripheral-initiated SMP recently failed (or the link
+ * dropped mid-pairing). Windows/Chrome Web Bluetooth often does not
+ * complete Just Works pairing; calling ble_gap_security_initiate again
+ * on the next connect just repeats a ~30 s SMP timeout and drops the
+ * authorized session in a loop. Skip initiate for this long. */
+#define SMP_FAIL_COOLDOWN_MS 600000
+static ble_addr_t s_smp_fail_addr;
+static int64_t    s_smp_fail_until_ms;
+static bool       s_smp_inflight;
+
 
 static struct ble_npl_callout s_adv_callout;
 static struct ble_npl_callout s_reject_callout;
@@ -92,6 +126,77 @@ static bool peer_is_bonded(uint16_t conn_handle)
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 
+static const char *ble_hs_reason_str(int reason)
+{
+    /* NimBLE reports HCI errors as 0x200 + HCI status. Accept both forms. */
+    int hci = (reason >= 0x200 && reason < 0x300) ? (reason - 0x200) : reason;
+    switch (hci) {
+    case 0x05: return "auth failure";
+    case 0x08: return "supervision timeout";
+    case 0x13: return "remote user terminated";
+    case 0x15: return "remote device terminated due to power off";
+    case 0x16: return "local host terminated";
+    case 0x1f: return "unspecified";
+    case 0x22: return "LMP/LL response timeout";
+    case 0x3d: return "MIC failure";
+    case 0x3e: return "failed to establish";
+    default:   return "other";
+    }
+}
+
+static void log_conn_params(const char *what, uint16_t conn_handle)
+{
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) return;
+    /* interval unit 1.25 ms, supervision timeout unit 10 ms, latency in events */
+    unsigned itvl_x100 = (unsigned)desc.conn_itvl * 125u; /* hundredths of a ms */
+    unsigned tmo_ms    = (unsigned)desc.supervision_timeout * 10u;
+    ESP_LOGI(TAG, "%s handle=%d itvl=%u.%02ums latency=%u timeout=%ums peer=%02x:%02x:%02x:%02x:%02x:%02x",
+             what, conn_handle, itvl_x100 / 100, itvl_x100 % 100,
+             (unsigned)desc.conn_latency, tmo_ms,
+             desc.peer_id_addr.val[5], desc.peer_id_addr.val[4],
+             desc.peer_id_addr.val[3], desc.peer_id_addr.val[2],
+             desc.peer_id_addr.val[1], desc.peer_id_addr.val[0]);
+}
+
+static void remember_smp_fail_addr(const ble_addr_t *addr, const char *why)
+{
+    if (!addr) return;
+    s_smp_fail_addr = *addr;
+    s_smp_fail_until_ms = now_ms() + SMP_FAIL_COOLDOWN_MS;
+    s_smp_inflight = false;
+    ESP_LOGW(TAG, "SMP failed (%s) — will skip security_initiate for this peer for %d s",
+             why, SMP_FAIL_COOLDOWN_MS / 1000);
+}
+
+static void remember_smp_fail_handle(uint16_t conn_handle, const char *why)
+{
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) == 0)
+        remember_smp_fail_addr(&desc.peer_id_addr, why);
+    else {
+        s_smp_inflight = false;
+        ESP_LOGW(TAG, "SMP failed (%s) handle=%d (no conn desc)", why, conn_handle);
+    }
+}
+
+static bool peer_smp_recently_failed(uint16_t conn_handle)
+{
+    if (now_ms() >= s_smp_fail_until_ms) return false;
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) return false;
+    return ble_addr_cmp(&desc.peer_id_addr, &s_smp_fail_addr) == 0;
+}
+
+static void close_pairing_window(const char *why)
+{
+    s_pairing_open = false;
+    ble_hs_cfg.sm_bonding = 0;
+    ble_npl_callout_stop(&s_lock_callout);
+    ESP_LOGI(TAG, "pairing window closed (%s)", why ? why : "");
+}
+
+
 static bool peer_in_kick_cooldown(uint16_t conn_handle)
 {
     if (now_ms() >= s_kicked_until_ms) return false;
@@ -113,9 +218,8 @@ static void reject_callout_fn(struct ble_npl_event *ev)
 
 static void lock_callout_fn(struct ble_npl_event *ev)
 {
-    s_pairing_open = false;
-    ble_hs_cfg.sm_bonding = 0;
-    ESP_LOGI(TAG, "pairing window closed");
+    (void)ev;
+    close_pairing_window("60 s timer");
 }
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
@@ -268,25 +372,43 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                     ble_npl_callout_reset(&s_reject_callout, ble_npl_time_ms_to_ticks32(100));
                 }
                 s_conn_handle = new_h;
+                s_tx_subscribed = false;
+                s_connect_ms = (uint32_t)(esp_timer_get_time() / 1000);
                 if (!authorized) {
                     ESP_LOGI(TAG, "connected (handle=%d) — not bonded, rejecting in 2.5s", new_h);
                     s_conn_authorized = false;
                     s_reject_handle = new_h;
                     ble_npl_callout_reset(&s_reject_callout, ble_npl_time_ms_to_ticks32(100));
                 } else {
-                    ESP_LOGI(TAG, "connected (handle=%d) — authorized", new_h);
+                    ESP_LOGI(TAG, "connected (handle=%d) — authorized (bonded=%d pairing_open=%d)",
+                             new_h, peer_is_bonded(new_h), s_pairing_open);
                     s_conn_authorized = true;
-                    /* Clip the transport's own ESP_LOGD gap-event traces while
-                     * a BLE client is connected — they serve no purpose over
-                     * the link and just pollute the log hook / push frame queue.
-                     * The set_level handler re-applies this on tag="*" changes. */
-                    esp_log_level_set("ble", ESP_LOG_WARN);
+                    log_conn_params("conn params", new_h);
+                    /* Clip the transport's own GAP traces while a client is
+                     * connected so they don't flood the log hook / notify
+                     * queue — unless the persistent debug flag is on. */
+                    if (!dorky_debug_enabled())
+                        esp_log_level_set("ble", ESP_LOG_WARN);
                     if (s_pairing_open) {
-                        /* Trigger OS pairing dialog on the central (Android bonds properly;
-                         * BlueZ/Chrome ignores it gracefully — connection still works). */
-                        ble_gap_security_initiate(new_h);
-                        s_pairing_open = false;
-                        ble_npl_callout_stop(&s_lock_callout);
+                        /* Peripheral-initiated SMP triggers the OS pairing
+                         * dialog on Android. Windows/Chrome Web Bluetooth
+                         * often does not complete Just Works pairing and the
+                         * 30 s SMP timeout drops an otherwise authorized
+                         * session. Do not close the pairing window until a
+                         * bond is actually stored, and skip re-initiate for
+                         * a peer that recently failed SMP. */
+                        if (peer_smp_recently_failed(new_h)) {
+                            ESP_LOGI(TAG, "skipping security_initiate handle=%d (recent SMP failure)",
+                                     new_h);
+                        } else {
+                            int rc = ble_gap_security_initiate(new_h);
+                            ESP_LOGI(TAG, "security_initiate handle=%d rc=%d", new_h, rc);
+                            if (rc == 0) {
+                                s_smp_inflight = true;
+                            } else if (rc != BLE_HS_EALREADY) {
+                                remember_smp_fail_handle(new_h, "security_initiate rc");
+                            }
+                        }
                     }
                 }
             }
@@ -296,8 +418,12 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
              * PC for phone" flow. Controller may refuse with ENOMEM; logged
              * once, no retry loop (see start_advertising). */
             schedule_advertising();
-        } else if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-            schedule_advertising();
+        } else {
+            ESP_LOGW(TAG, "connect failed status=%d (0x%02x %s)",
+                     event->connect.status, event->connect.status,
+                     ble_hs_reason_str(event->connect.status));
+            if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE)
+                schedule_advertising();
         }
         break;
 
@@ -305,29 +431,41 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         uint16_t h = event->enc_change.conn_handle;
         if (h != s_conn_handle) break;
         bool bonded = peer_is_bonded(h);
-        ESP_LOGI(TAG, "enc_change handle=%d status=%d bonded=%d",
-                 h, event->enc_change.status, bonded);
-        if (event->enc_change.status == 0 && s_pairing_open && bonded) {
-            s_pairing_open = false;
-            ble_npl_callout_stop(&s_lock_callout);
-            ESP_LOGI(TAG, "bond established, pairing window closed");
+        ESP_LOGI(TAG, "enc_change handle=%d status=%d (0x%02x %s) bonded=%d",
+                 h, event->enc_change.status, event->enc_change.status,
+                 ble_hs_reason_str(event->enc_change.status), bonded);
+        s_smp_inflight = false;
+        if (event->enc_change.status == 0 && bonded) {
+            if (s_pairing_open)
+                close_pairing_window("bond established");
+        } else if (event->enc_change.status != 0) {
+            remember_smp_fail_handle(h, "enc_change");
         }
         break;
     }
 
     case BLE_GAP_EVENT_DISCONNECT: {
         uint16_t h = event->disconnect.conn.conn_handle;
-        ESP_LOGI(TAG, "disconnected handle=%d (reason=%d)", h, event->disconnect.reason);
+        int reason = event->disconnect.reason;
+        /* WARN so this stays visible even when the "ble" tag is clipped to
+         * WARN during an authorized session (otherwise the reconnect loop
+         * hides its own cause). */
+        ESP_LOGW(TAG, "disconnected handle=%d reason=%d (0x%03x %s)",
+                 h, reason, reason, ble_hs_reason_str(reason));
         if (h == s_reject_handle) {
             ble_npl_callout_stop(&s_reject_callout);
             s_reject_handle = BLE_HS_CONN_HANDLE_NONE;
         }
         if (h == s_conn_handle) {
+            if (s_smp_inflight)
+                remember_smp_fail_addr(&event->disconnect.conn.peer_id_addr,
+                                       "disconnect mid-pairing");
+            s_smp_inflight = false;
             s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            s_tx_subscribed = false;
             s_conn_authorized = false;
             /* If the connection ended without producing a bond and we still
-             * have zero bonds, the CONNECT handler's optimistic close left the
-             * pairing window shut. Re-open indefinitely so the user can retry
+             * have zero bonds, re-open the window so the user can retry
              * (e.g. after wiping the stale OS bond that caused a 517). */
             if (!s_pairing_open && dorky_ble_bond_count() == 0) {
                 open_pairing_window(false);
@@ -344,13 +482,27 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_MTU:
-        ESP_LOGI(TAG, "MTU updated: %d", event->mtu.value);
+        ESP_LOGI(TAG, "MTU updated: handle=%d mtu=%d",
+                 event->mtu.conn_handle, event->mtu.value);
         break;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
-        ESP_LOGI(TAG, "subscribe: attr=%d, notify=%d",
+        if (event->subscribe.conn_handle == s_conn_handle &&
+            event->subscribe.attr_handle == s_tx_attr_handle) {
+            s_tx_subscribed = event->subscribe.cur_notify != 0;
+        }
+        ESP_LOGI(TAG, "subscribe: handle=%d attr=%d notify=%d indicate=%d",
+                 event->subscribe.conn_handle,
                  event->subscribe.attr_handle,
-                 event->subscribe.cur_notify);
+                 event->subscribe.cur_notify,
+                 event->subscribe.cur_indicate);
+        break;
+
+    case BLE_GAP_EVENT_CONN_UPDATE:
+        ESP_LOGI(TAG, "conn_update handle=%d status=%d",
+                 event->conn_update.conn_handle, event->conn_update.status);
+        if (event->conn_update.status == 0)
+            log_conn_params("conn params (updated)", event->conn_update.conn_handle);
         break;
 
     /* ---- SMP diagnostics ---- */
@@ -360,15 +512,24 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         break;
 
     case BLE_GAP_EVENT_PARING_COMPLETE:   /* typo is upstream NimBLE */
-        ESP_LOGI(TAG, "pairing_complete: conn=%d status=%d",
+        ESP_LOGI(TAG, "pairing_complete: conn=%d status=%d (0x%02x %s)",
                  event->pairing_complete.conn_handle,
-                 event->pairing_complete.status);
+                 event->pairing_complete.status,
+                 event->pairing_complete.status,
+                 ble_hs_reason_str(event->pairing_complete.status));
+        if (event->pairing_complete.status != 0)
+            remember_smp_fail_handle(event->pairing_complete.conn_handle, "pairing_complete");
         break;
 
     case BLE_GAP_EVENT_REPEAT_PAIRING:
         ESP_LOGI(TAG, "repeat_pairing: conn=%d — accepting",
                  event->repeat_pairing.conn_handle);
         return BLE_GAP_REPEAT_PAIRING_RETRY;
+
+    case BLE_GAP_EVENT_NOTIFY_TX:
+        /* One per notify: count only (was a per-notify debug line). */
+        s_ntf_tx_events++;
+        break;
 
     default:
         ESP_LOGD(TAG, "gap event type=%d", event->type);
@@ -472,19 +633,124 @@ int dorky_ble_init(ble_request_cb_t on_request, void *ctx)
     return 0;
 }
 
+/* ---- notify statistics + back-pressure ----
+ * Never log per notify: at a few hundred notifies/s the log line itself
+ * (USB console + BLE log mirror) becomes the load. Count instead and let
+ * dorky_ble_tx_stats() / the heartbeat print the totals. */
+
 int dorky_ble_notify(const uint8_t *data, size_t len)
 {
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) return -1;
+    if (!tx_allowed()) return -1;
 
     struct os_mbuf *om = ble_hs_mbuf_from_flat(data, len);
-    if (!om) return -1;
+    if (!om) {
+        s_ntf_enomem++;
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (dorky_debug_enabled() && (now - s_ntf_warn_ms) >= 5000) {
+            s_ntf_warn_ms = now;
+            ESP_LOGW(TAG, "notify ENOMEM (mbuf) x%" PRIu32 " total, msys free=%d",
+                     s_ntf_enomem, os_msys_num_free());
+        }
+        return BLE_HS_ENOMEM;
+    }
 
-    return ble_gatts_notify_custom(s_conn_handle, s_tx_attr_handle, om);
+    /* ble_gatts_notify_custom consumes om on success and on failure. */
+    int rc = ble_gatts_notify_custom(s_conn_handle, s_tx_attr_handle, om);
+    if (rc == 0) s_ntf_ok++;
+    else         s_ntf_err++;
+    return rc;
+}
+
+bool dorky_ble_tx_credit(int chunks)
+{
+    if (!dorky_ble_tx_ready()) return false;
+    /* Status/control pushes: just enough host buffers for this frame plus a
+     * tiny reserve for ATT responses. No heap check (see header). */
+    return os_msys_num_free() >= chunks + DORKY_BLE_MSYS_STATUS_RESERVE;
+}
+
+static uint32_t s_trace_iram_floor = DORKY_BLE_TRACE_IRAM_FLOOR;
+static uint32_t s_trace_iram_big_floor = DORKY_BLE_TRACE_IRAM_BIG_FLOOR;
+static bool     s_trace_gate_open = true;
+static uint32_t s_trace_gate_closed;
+
+void dorky_ble_trace_gate_set(uint32_t iram_floor, uint32_t iram_big_floor)
+{
+    if (iram_floor) s_trace_iram_floor = iram_floor;
+    if (iram_big_floor) s_trace_iram_big_floor = iram_big_floor;
+    s_trace_gate_open = true;     /* re-evaluated on the next call */
+}
+
+bool dorky_ble_trace_credit(void)
+{
+    if (!dorky_ble_tx_ready()) return false;
+    /* One trace notify is <= 509 B = at most 2 msys blocks; keep a reserve
+     * for ATT responses / SMP / L2CAP on top. */
+    if (os_msys_num_free() < 2 + DORKY_BLE_MSYS_RESERVE) return false;
+
+    size_t free_b = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t big_b  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_trace_gate_open) {
+        if (free_b < s_trace_iram_floor || big_b < s_trace_iram_big_floor) {
+            s_trace_gate_open = false;
+            s_trace_gate_closed++;
+        }
+    } else {
+        /* Hysteresis: reopen only with clear headroom. */
+        if (free_b >= s_trace_iram_floor + DORKY_BLE_TRACE_IRAM_HYST &&
+            big_b >= s_trace_iram_big_floor)
+            s_trace_gate_open = true;
+    }
+    return s_trace_gate_open;
+}
+
+void dorky_ble_tx_stats(dorky_ble_tx_stats_t *out)
+{
+    if (!out) return;
+    out->ok = s_ntf_ok;
+    out->enomem = s_ntf_enomem;
+    out->err = s_ntf_err;
+    out->tx_events = s_ntf_tx_events;
+    out->msys_free = os_msys_num_free();
+    out->gate_open = s_trace_gate_open;
+    out->gate_closed = s_trace_gate_closed;
+    out->iram_floor = s_trace_iram_floor;
+    out->iram_big_floor = s_trace_iram_big_floor;
+}
+
+bool dorky_ble_tx_ready(void)
+{
+    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE && tx_allowed();
+}
+
+int dorky_ble_free_bufs(void)
+{
+    return os_msys_num_free();
 }
 
 bool dorky_ble_connected(void)
 {
     return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+}
+
+bool dorky_ble_authorized(void)
+{
+    return s_conn_authorized && s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+}
+
+void dorky_ble_debug_snapshot(char *buf, size_t len)
+{
+    if (!buf || len == 0) return;
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        snprintf(buf, len, "ble=idle pairing=%s bonds=%d",
+                 s_pairing_open ? "open" : "locked", dorky_ble_bond_count());
+        return;
+    }
+    snprintf(buf, len, "ble=conn h=%d auth=%d mtu=%u pairing=%s bonds=%d smp=%s",
+             s_conn_handle, s_conn_authorized, (unsigned)ble_att_mtu(s_conn_handle),
+             s_pairing_open ? "open" : "locked", dorky_ble_bond_count(),
+             s_smp_inflight ? "inflight" : "idle");
 }
 
 uint16_t dorky_ble_mtu(void)

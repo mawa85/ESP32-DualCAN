@@ -59,6 +59,7 @@ Metadata fields (`@name`, `@description`, `@bus`) appear in the web UI.
 | `state_get(key [, default])` | str \| nil | Read string from NVS flash |
 | `state_remove(key)` | — | Delete key from NVS flash |
 | `millis()` | int | Milliseconds since boot |
+| `dorky_debug()` / `dorky_debug(on)` | bool | Persistentes Debug-Flag (NVS) abfragen oder setzen |
 | `print(msg)` | — | Log to web UI panel |
 | `str(v)` | string | Convert any value to string |
 | `format(fmt, ...)` | string | C-style string formatting |

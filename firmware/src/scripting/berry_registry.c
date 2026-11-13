@@ -1,3 +1,4 @@
+#include "board/ext_ram.h"
 #include "scripting/berry_registry.h"
 
 #include <stdarg.h>
@@ -289,7 +290,7 @@ typedef struct {
 } action_entry_t;
 
 /* Registry of all registered actions. Name is the lookup key. */
-static action_entry_t s_actions[MAX_ACTIONS];
+DORKY_EXT_BSS static action_entry_t s_actions[MAX_ACTIONS];
 
 static int find_action(const char *name)
 {

@@ -221,6 +221,41 @@ test('trace push decodes hex data into Uint8Array', () => {
   assert.deepEqual(Array.from(frames[0].data), [0x01, 0x02, 0xde, 0xad, 0xbe, 0xef]);
 });
 
+test('trace_batch push fans out into individual frames', () => {
+  const { device, transport, proto } = makePair();
+  const frames: Array<{ bus: number; id: number; ts: number; data: Uint8Array }> = [];
+  proto.onTrace((f) => frames.push(f));
+
+  device.push(rx(transport), {
+    type: 'trace_batch',
+    f: [
+      [0, 0x118, 1000, '0102'],
+      [1, 0x257, 1005, ''],
+    ],
+  });
+
+  assert.equal(frames.length, 2);
+  assert.deepEqual([frames[0].bus, frames[0].id, frames[0].ts], [0, 0x118, 1000]);
+  assert.deepEqual(Array.from(frames[0].data), [1, 2]);
+  assert.deepEqual([frames[1].bus, frames[1].id, frames[1].ts], [1, 0x257, 1005]);
+  assert.equal(frames[1].data.length, 0);
+});
+
+test('several legacy trace frames packed into one notification', () => {
+  const { device, transport, proto } = makePair();
+  const frames: Array<{ id: number }> = [];
+  proto.onTrace((f) => frames.push(f));
+
+  const a = device.encode({ type: 'trace', bus: 0, id: 1, ts: 1, data: 'AA' });
+  const b = device.encode({ type: 'trace', bus: 0, id: 2, ts: 2, data: 'BB' });
+  const pkt = new Uint8Array(a.length + b.length);
+  pkt.set(a);
+  pkt.set(b, a.length);
+  rx(transport)(pkt);
+
+  assert.deepEqual(frames.map((f) => f.id), [1, 2]);
+});
+
 test('subscribe, push, unsubscribe lifecycle', async () => {
   const { device, transport, proto } = makePair();
   const updates: unknown[] = [];
@@ -260,7 +295,7 @@ test('high-level methods serialize correct ops', async () => {
     'system.info',
     'wifi.set_creds',
   ]);
-  assert.deepEqual(device.recorded[0].params, { buses: [0, 1] });
+  assert.deepEqual(device.recorded[0].params, { buses: [0, 1], batch: true });
   assert.deepEqual(device.recorded[2].params, { enabled: true, bus: 0 });
   assert.deepEqual(device.recorded[4].params, { ssid: 'ssid', psk: 'psk' });
 });

@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "RX-Filterprofile fuer bus.set_filter (tools/upload_script.py --filters <profil>).",
+    "Leere Liste = alles annehmen. Max 64 IDs/Bus; bis 32 IDs exakt im MCP2518FD (CAN-A),",
+    "TWAI (CAN-B) bekommt eine Sammelmaske, der Rest wird in Software verworfen.",
+    "Bus 0 = CAN-A = Vehicle-CAN. Bus 1 = CAN-B: am Model Y Juniper ab SOP10",
+    "(Berlin ab 2026-04-01) liegt am rechten A-Saeulen-Port Party-CAN statt Chassis-CAN.",
+    "IDs/Layouts aus Model 3/Y-DBCs (repo dbc/, opendbc, joshwardell) - am Juniper NICHT verifiziert."
+  ],
+  "juniper": {
+    "0": ["0x102", "0x103", "0x118", "0x129", "0x257", "0x273", "0x292", "0x294", "0x2C2",
+          "0x2C3", "0x2E1", "0x313", "0x334", "0x39B", "0x39D", "0x3E9", "0x3F5"],
+    "1": ["0x118", "0x129", "0x145", "0x257", "0x2B9", "0x311", "0x39D"]
+  },
+  "bench": {
+    "0": ["0x102", "0x103", "0x118", "0x129", "0x257", "0x273", "0x292", "0x294", "0x2C2",
+          "0x2C3", "0x2E1", "0x313", "0x334", "0x39B", "0x39D", "0x3E9", "0x3F5"],
+    "1": ["0x102", "0x103", "0x118", "0x129", "0x257", "0x292", "0x39D", "0x3F5"]
+  },
+  "none": { "0": [], "1": [] }
+}

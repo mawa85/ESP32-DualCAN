@@ -7,6 +7,7 @@
 #include "can/msg_codec.h"
 #include "led/led_rgb.h"
 #include "storage/state.h"
+#include "debug/dorky_debug.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 
@@ -427,6 +428,24 @@ static int l_millis(bvm *vm)
     be_return(vm);
 }
 
+
+/* dorky_debug() -> bool
+ * dorky_debug(on:bool) -> bool
+ * Query or set the persistent firmware debug flag (NVS). When on, BLE GAP
+ * events stay at DEBUG even while a client is connected and a 10 s
+ * heartbeat is printed on the serial console. */
+static int l_dorky_debug(bvm *vm)
+{
+    if (be_top(vm) >= 1) {
+        CHECK_TYPE(vm, 1, be_isbool(vm, 1), "bool");
+        if (dorky_debug_set(be_tobool(vm, 1)) != ESP_OK) {
+            be_raise(vm, "runtime_error", "failed to persist debug flag");
+        }
+    }
+    be_pushbool(vm, dorky_debug_enabled());
+    be_return(vm);
+}
+
 /* ---- Registration ----
  * Called once during Berry VM initialisation to expose all native functions.
  * The names here are what Berry scripts see at global scope. Keep the
@@ -463,4 +482,5 @@ void berry_register_bindings(bvm *vm)
 
     /* System */
     be_regfunc(vm, "millis", l_millis);
+    be_regfunc(vm, "dorky_debug", l_dorky_debug);
 }

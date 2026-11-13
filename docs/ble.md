@@ -183,3 +183,74 @@ active; the advertising watchdog (runs every 10 s) retries silently. After
   `ble.reset_pairs` op handlers.
 - `webui/src/transport/ble.ts` — Web Bluetooth client.
 - `webui/src/components/views/SettingsView.svelte` — Bluetooth panel.
+
+---
+
+## Debug-Modus
+
+Ein persistentes Debug-Flag (NVS, Namespace `dorky`, Schlüssel `debug`) schaltet
+ausführliche BLE- und Systemlogs ein, ohne die Firmware neu zu flashen. Es
+überlebt einen Reboot, bis du es wieder ausschaltest (oder NVS löschst).
+
+### Einschalten
+
+Auf der USB-Serial-JTAG-Konsole (115200 8N1, z. B. COM7 / `/dev/ttyACM0`):
+
+```
+debug on
+debug off
+debug status
+```
+
+Aus einem Berry-Skript oder der Web-UI-Konsole:
+
+```
+dorky_debug(true)    # einschalten, gibt den neuen Zustand zurück
+dorky_debug(false)   # ausschalten
+dorky_debug()        # nur abfragen
+```
+
+Über das bestehende JSON-Protokoll (Web-UI / `Protocol.setDebug`):
+
+```json
+{"op":"log.set_debug","id":1,"enabled":true}
+{"op":"log.get_debug","id":2}
+```
+
+Optional zur Compile-Zeit: `-DDORKY_DEBUG_DEFAULT=1` in `build_flags`, greift
+nur wenn in NVS noch kein Wert liegt.
+
+### Was geloggt wird, wenn das Flag an ist
+
+- Reset-Grund (`esp_reset_reason`) steht **immer** einmal beim Boot im Log,
+  auch wenn Debug aus ist.
+- Der Tag `ble` bleibt auf DEBUG, auch während eine Web-UI verbunden ist
+  (sonst beschneidet die Firmware ihn auf WARN und versteckt Disconnect-Gründe).
+- Jedes GAP-Ereignis mit Details: Connect-Status, Disconnect-Grund als Dezimal
+  + Hex + Text (z. B. `0x208` Supervision-Timeout, `0x213` Remote User
+  Terminated, `0x216` Local Host Terminated, `0x23e` Failed to Establish),
+  Verbindungsparameter (Interval, Latency, Supervision-Timeout) bei Connect
+  und `CONN_UPDATE`, Enc/Pairing-Ergebnisse, MTU, Subscribe, Notify-Fehler
+  (ENOMEM / Queue).
+- Alle 10 s eine Heartbeat-Zeile (`debug: hb …`): Uptime, freier Heap und
+  PSRAM, Min-Heap, BLE-Zustand, CAN-Status inkl. TEC/REC beider Busse,
+  Stack-High-Water-Marks der Tasks.
+
+Wenn das Flag aus ist, bleibt das bisherige Verhalten (BLE-Tag wird nach dem
+Connect auf WARN gesetzt). Disconnects werden trotzdem immer auf WARN
+geschrieben, damit ein Reconnect-Loop seinen Grund nicht mehr versteckt.
+
+### Chrome/Edge unter Windows reconnectet im Kreis
+
+Ursache: Bei offenem Pairing-Fenster hat die Firmware `ble_gap_security_initiate`
+aufgerufen (nötig, damit Android den Pairing-Dialog zeigt). Windows-Web-Bluetooth
+schließt Just-Works-Pairing oft nicht ab; nach typisch ~30 s SMP-Timeout fällt
+die Verbindung. Die Firmware hat das Fenster außerdem schon beim Initiate
+geschlossen und nach dem Drop (0 Bonds) wieder geöffnet — der nächste Connect
+startet denselben Zyklus. Zusätzlich war der Disconnect-Log auf INFO und damit
+hinter dem WARN-Clip unsichtbar.
+
+Änderung: Das Pairing-Fenster bleibt offen, bis wirklich ein Bond in NVS liegt.
+Scheitert SMP mit einem Peer, wird `security_initiate` für diesen Peer für
+10 Minuten nicht erneut aufgerufen. Die Sitzung bleibt über das offene Fenster
+autorisiert. Android kann beim ersten Connect weiterhin pairen.

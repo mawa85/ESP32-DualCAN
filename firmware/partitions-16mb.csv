@@ -1,0 +1,12 @@
+# Name,       Type, SubType,  Offset,   Size,     Flags
+# LilyGo T-2CAN FD: 16 MB flash (0x1000000). Bootloader + nvs/phy occupy
+# 0x0000-0xFFFF. App slots are 3 MB each (the C6 image is 1.75 MB and the
+# S3 build pulls in the MCP2518FD driver). LittleFS is 2 MB for scripts
+# and DBC binaries. The rest of the flash is left unallocated.
+# WARNING: changing these sizes reformats LittleFS on next flash.
+nvs,          data, nvs,      0x9000,   0x4000,
+otadata,      data, ota,      0xd000,   0x2000,
+phy_init,     data, phy,      0xf000,   0x1000,
+app0,         app,  ota_0,    0x10000,  0x300000,
+app1,         app,  ota_1,    ,         0x300000,
+littlefs,     data, littlefs, ,         0x200000,

@@ -67,37 +67,56 @@ static int apply_creds(const char *ssid, const char *psk)
     return 0;
 }
 
-void wifi_init(void)
-{
-    s_event_group = xEventGroupCreate();
+/* The WiFi driver (+ netif/LWIP, wifi task, static RX buffers) costs
+ * roughly 40-60 KB of internal RAM that the BT controller needs at runtime.
+ * It is only brought up when credentials exist (at boot) or when they are
+ * set over BLE (wifi.set_creds). Without credentials WiFi stays off. */
+static bool s_driver_up;
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    s_sta_netif = esp_netif_create_default_wifi_sta();
+static esp_err_t wifi_driver_start(const char *ssid, const char *psk)
+{
+    if (s_driver_up) return ESP_OK;
+
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    if (!s_sta_netif) s_sta_netif = esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init));
+    err = esp_wifi_init(&init);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(err)); return err; }
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, on_wifi_event, NULL, NULL));
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    if (apply_creds(ssid, psk) != 0) {
+        ESP_LOGE(TAG, "apply_creds failed for %s", ssid);
+    }
+    err = esp_wifi_start();
+    if (err != ESP_OK) { ESP_LOGE(TAG, "esp_wifi_start: %s", esp_err_to_name(err)); return err; }
+    s_driver_up = true;
+    ESP_LOGI(TAG, "connecting to %s", ssid);
+    return ESP_OK;
+}
+
+void wifi_init(void)
+{
+    s_event_group = xEventGroupCreate();
 
     char ssid[33] = {0}, psk[65] = {0};
     if (load_creds(ssid, sizeof(ssid), psk, sizeof(psk)) == 0) {
-        ESP_LOGI(TAG, "connecting to %s", ssid);
-        if (apply_creds(ssid, psk) == 0) {
-            ESP_ERROR_CHECK(esp_wifi_start());
-        } else {
-            ESP_LOGE(TAG, "apply_creds failed for %s", ssid);
-        }
+        wifi_driver_start(ssid, psk);
     } else {
-        /* No creds yet — start the driver so the API is alive but don't
-         * try to connect. wifi_set_creds() will (re)start the connection. */
-        ESP_ERROR_CHECK(esp_wifi_start());
-        ESP_LOGI(TAG, "no NVS credentials; STA idle");
+        ESP_LOGI(TAG, "no NVS credentials; WiFi off (starts on wifi.set_creds)");
     }
+}
+
+bool wifi_driver_running(void)
+{
+    return s_driver_up;
 }
 
 bool wifi_connected(void)
@@ -127,10 +146,14 @@ int wifi_set_creds(const char *ssid, const char *psk)
 
     /* Empty SSID → forget network */
     if (!ssid || ssid[0] == '\0') {
-        esp_wifi_disconnect();
-        /* Clear old creds from NVS */
         state_remove(WIFI_NS, WIFI_KEY_SSID);
         state_remove(WIFI_NS, WIFI_KEY_PSK);
+        if (!s_driver_up) {
+            ESP_LOGW(TAG, "credentials cleared (WiFi was off)");
+            return 0;
+        }
+        /* Driver stays initialised until reboot; then WiFi stays off. */
+        esp_wifi_disconnect();
         /* Apply an empty config so the driver doesn't auto-connect */
         wifi_config_t empty = {0};
         esp_wifi_set_config(WIFI_IF_STA, &empty);
@@ -142,6 +165,10 @@ int wifi_set_creds(const char *ssid, const char *psk)
 
     if (state_set(WIFI_NS, WIFI_KEY_SSID, ssid) != ESP_OK) return -1;
     if (state_set(WIFI_NS, WIFI_KEY_PSK,  psk)  != ESP_OK) return -1;
+
+    if (!s_driver_up) {
+        return wifi_driver_start(ssid, psk) == ESP_OK ? 0 : -1;
+    }
 
     /* Bring the link down, push new config, bring it back up. */
     esp_wifi_disconnect();

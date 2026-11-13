@@ -62,7 +62,7 @@ jobs:
             ~/.platformio
             firmware/.cache
             firmware/.pio
-          key: pio-esp32c6-${{ hashFiles('firmware/platformio.ini', 'firmware/sdkconfig.defaults') }}-core6.2.0
+          key: pio-fw-${{ hashFiles('firmware/platformio.ini', 'firmware/sdkconfig.defaults', 'firmware/sdkconfig.defaults.t2can-fd') }}-core6.2.0
 
       - uses: actions/setup-python@v5
         with:
@@ -74,10 +74,16 @@ jobs:
         run: pip install "platformio==6.2.0"
 
       - name: Build production firmware
-        run: pio run -d firmware -e esp32-c6
+        run: pio run -d firmware -e esp32-c6 -e t2can-fd
 
-      - name: Upload firmware artifact
+      - name: Upload C6 firmware artifact
         uses: actions/upload-artifact@v4
         with:
           name: firmware-bin
           path: firmware/.pio/build/esp32-c6/firmware.bin
+
+      - name: Upload T-2CAN FD firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-t2can-fd
+          path: firmware/.pio/build/t2can-fd/firmware.bin

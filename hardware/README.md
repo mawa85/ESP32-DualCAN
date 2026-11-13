@@ -1,5 +1,9 @@
 # Hardware — ESP32-DualCAN
 
+The firmware also runs on a LilyGo T-2CAN FD (ESP32-S3 + MCP2518FD + TWAI). That board is not this PCB. Pin map, power, termination, and the Enhauto / S3XY harness adapter are in [`docs/wiring-t2can-fd-s3xy.md`](../docs/wiring-t2can-fd-s3xy.md).
+
+## Dorky Commander PCB
+
 <img width="555"  alt="image" src="https://github.com/user-attachments/assets/e7944936-6bc0-426c-abbd-16756143bc65" /> 
 
 ## Characteristics

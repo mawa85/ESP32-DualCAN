@@ -15,5 +15,5 @@ file(GLOB berry_port_srcs "port/*.c")
 idf_component_register(
     SRCS ${berry_core_srcs} ${berry_port_srcs}
     INCLUDE_DIRS "src" "port"
-    REQUIRES log
+    REQUIRES log heap
 )

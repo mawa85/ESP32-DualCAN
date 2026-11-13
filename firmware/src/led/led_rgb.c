@@ -1,18 +1,19 @@
 #include "led/led_rgb.h"
 
+#include "board/board.h"
 #include "led_strip.h"
 #include "esp_log.h"
 
-#define RGB_LED_GPIO    8
-#define RGB_LED_COUNT   1
+static const char *TAG = "led";
 
+#if BOARD_HAS_RGB_LED
 static led_strip_handle_t s_strip;
 
 esp_err_t led_rgb_init(void)
 {
     led_strip_config_t cfg = {
-        .strip_gpio_num = RGB_LED_GPIO,
-        .max_leds = RGB_LED_COUNT,
+        .strip_gpio_num = BOARD_RGB_LED_GPIO,
+        .max_leds = BOARD_RGB_LED_COUNT,
         .led_model = LED_MODEL_WS2812,
         .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
         .flags.invert_out = false,
@@ -44,3 +45,21 @@ esp_err_t led_rgb_off(void)
     if (!s_strip) return ESP_ERR_INVALID_STATE;
     return led_strip_clear(s_strip);
 }
+#else
+esp_err_t led_rgb_init(void)
+{
+    ESP_LOGI(TAG, "no RGB LED on this board");
+    return ESP_OK;
+}
+
+esp_err_t led_rgb_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    (void)r; (void)g; (void)b;
+    return ESP_OK;
+}
+
+esp_err_t led_rgb_off(void)
+{
+    return ESP_OK;
+}
+#endif

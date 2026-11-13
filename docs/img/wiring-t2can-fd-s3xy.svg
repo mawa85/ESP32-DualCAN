@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="820" viewBox="0 0 1200 820">
+  <rect width="1200" height="820" fill="#f7f5f0"/>
+  <text x="40" y="36" font-family="Georgia, serif" font-size="22" fill="#1c1917">T-2CAN FD to Enhauto / S3XY harness</text>
+  <text x="40" y="58" font-family="sans-serif" font-size="13" fill="#44403c">Diagram colors are labels, not harness jacket colors. Confirm every pin with a meter before power.</text>
+
+  <!-- Harness connector -->
+  <rect x="40" y="90" width="280" height="470" rx="8" fill="#fff" stroke="#1c1917" stroke-width="1.5"/>
+  <text x="56" y="116" font-family="sans-serif" font-size="14" font-weight="700" fill="#1c1917">S3XY harness plug</text>
+  <text x="56" y="134" font-family="sans-serif" font-size="11" fill="#57534e">Mates with Dorky J1</text>
+  <text x="56" y="150" font-family="sans-serif" font-size="11" fill="#57534e">Molex 70553 6p (PCB netlist)</text>
+
+  <!-- pins y: 190, 250, 310, 370, 430, 490 -->
+  <g font-family="sans-serif" font-size="13" fill="#1c1917">
+    <circle cx="70" cy="190" r="8" fill="#b91c1c"/>
+    <text x="88" y="195">1  +BATT / Vbat  12 V</text>
+    <circle cx="70" cy="250" r="8" fill="#292524"/>
+    <text x="88" y="255">2  GND</text>
+    <circle cx="70" cy="310" r="8" fill="#ca8a04"/>
+    <text x="88" y="315">3  CAN1_L  chassis L</text>
+    <circle cx="70" cy="370" r="8" fill="#15803d"/>
+    <text x="88" y="375">4  CAN1_H  chassis H</text>
+    <circle cx="70" cy="430" r="8" fill="#38bdf8"/>
+    <text x="88" y="435">5  CAN0_L  vehicle L</text>
+    <circle cx="70" cy="490" r="8" fill="#1d4ed8"/>
+    <text x="88" y="495">6  CAN0_H  vehicle H</text>
+  </g>
+  <text x="56" y="535" font-family="sans-serif" font-size="11" fill="#57534e">Pin 1 is PCB pad 1 of footprint</text>
+  <text x="56" y="551" font-family="sans-serif" font-size="11" fill="#57534e">CONN_705530005. Identify it by</text>
+  <text x="56" y="567" font-family="sans-serif" font-size="11" fill="#57534e">continuity, not by eye.</text>
+
+  <!-- wires -->
+  <!-- 12V with fuse -->
+  <line x1="320" y1="190" x2="430" y2="190" stroke="#b91c1c" stroke-width="3"/>
+  <rect x="430" y="176" width="70" height="28" rx="3" fill="#fff" stroke="#b91c1c" stroke-width="2"/>
+  <text x="446" y="195" font-family="sans-serif" font-size="12" fill="#b91c1c">fuse</text>
+  <line x1="500" y1="190" x2="760" y2="160" stroke="#b91c1c" stroke-width="3"/>
+
+  <line x1="320" y1="250" x2="760" y2="210" stroke="#292524" stroke-width="3"/>
+  <line x1="320" y1="370" x2="760" y2="360" stroke="#15803d" stroke-width="3"/>
+  <line x1="320" y1="310" x2="760" y2="410" stroke="#ca8a04" stroke-width="3"/>
+  <line x1="320" y1="490" x2="760" y2="520" stroke="#1d4ed8" stroke-width="3"/>
+  <line x1="320" y1="430" x2="760" y2="570" stroke="#38bdf8" stroke-width="3"/>
+
+  <!-- T-2CAN board -->
+  <rect x="760" y="90" width="400" height="560" rx="8" fill="#fff" stroke="#1c1917" stroke-width="1.5"/>
+  <text x="776" y="116" font-family="sans-serif" font-size="14" font-weight="700" fill="#1c1917">LilyGo T-2CAN FD</text>
+  <text x="776" y="134" font-family="sans-serif" font-size="11" fill="#57534e">Terminal order on the silkscreen is</text>
+  <text x="776" y="150" font-family="sans-serif" font-size="11" fill="#57534e">unverified — check with a meter.</text>
+
+  <text x="776" y="180" font-family="sans-serif" font-size="13" font-weight="700" fill="#1c1917">Power  WJ500V-5.08-2P</text>
+  <text x="776" y="200" font-family="sans-serif" font-size="12" fill="#b91c1c">+24V net  ← harness 12 V (after fuse)</text>
+  <text x="776" y="218" font-family="sans-serif" font-size="12" fill="#292524">GND      ← harness GND (power return)</text>
+
+  <text x="776" y="258" font-family="sans-serif" font-size="13" font-weight="700" fill="#1c1917">P1  CAN-B  WJ15EDGVC-3.81-4P</text>
+  <text x="776" y="276" font-family="sans-serif" font-size="12" fill="#57534e">TWAI, Dorky bus 1, chassis CAN</text>
+  <text x="776" y="298" font-family="sans-serif" font-size="12" fill="#15803d">CANHB  ← pin 4 chassis H</text>
+  <text x="776" y="316" font-family="sans-serif" font-size="12" fill="#ca8a04">CANLB  ← pin 3 chassis L</text>
+  <text x="776" y="334" font-family="sans-serif" font-size="12" fill="#57534e">SGNDB  leave open</text>
+  <text x="776" y="352" font-family="sans-serif" font-size="12" fill="#57534e">DGNDB  do not tie to harness GND</text>
+
+  <text x="776" y="390" font-family="sans-serif" font-size="13" font-weight="700" fill="#1c1917">P2  CAN-A  WJ15EDGVC-3.81-4P</text>
+  <text x="776" y="408" font-family="sans-serif" font-size="12" fill="#57534e">MCP2518FD, Dorky bus 0, vehicle CAN</text>
+  <text x="776" y="430" font-family="sans-serif" font-size="12" fill="#1d4ed8">CANHA  ← pin 6 vehicle H</text>
+  <text x="776" y="448" font-family="sans-serif" font-size="12" fill="#38bdf8">CANLA  ← pin 5 vehicle L</text>
+  <text x="776" y="466" font-family="sans-serif" font-size="12" fill="#57534e">SGNDA  leave open</text>
+  <text x="776" y="484" font-family="sans-serif" font-size="12" fill="#57534e">DGNDA  do not tie to harness GND</text>
+
+  <text x="776" y="520" font-family="sans-serif" font-size="12" fill="#1c1917">120 Ω parts RZ2 (CAN-A) and RZ1 (CAN-B)</text>
+  <text x="776" y="538" font-family="sans-serif" font-size="12" fill="#1c1917">are on the schematic. No jumper found.</text>
+  <text x="776" y="556" font-family="sans-serif" font-size="12" fill="#1c1917">Measure H–L. Remove them if ~120 Ω</text>
+  <text x="776" y="574" font-family="sans-serif" font-size="12" fill="#1c1917">so the car’s own termination stays in place.</text>
+  <text x="776" y="604" font-family="sans-serif" font-size="12" fill="#57534e">TD501MCAN has no standby pin.</text>
+  <text x="776" y="622" font-family="sans-serif" font-size="12" fill="#57534e">CANG / SGND is the isolated CAN ground.</text>
+
+  <text x="40" y="700" font-family="sans-serif" font-size="12" fill="#44403c">PCB pad nets and the schematic note (Vbat, Gnd, Chassis L/H, Vehicle L/H) agree.</text>
+  <text x="40" y="718" font-family="sans-serif" font-size="12" fill="#44403c">The schematic symbol’s wires do not. This drawing follows the PCB. See the wiring guide.</text>
+  <text x="40" y="748" font-family="sans-serif" font-size="12" fill="#44403c">Fuse is in the 12 V lead, before the T-2CAN power terminal. 1 A is a recommendation, not a schematic value.</text>
+  <text x="40" y="778" font-family="sans-serif" font-size="12" fill="#44403c">Web UI is unchanged and connects over BLE. This cable does not carry USB or Bluetooth.</text>
+</svg>
