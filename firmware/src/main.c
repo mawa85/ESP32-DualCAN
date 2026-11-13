@@ -1,3 +1,4 @@
+#include "board/ext_ram.h"
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -41,7 +42,7 @@ static void status_led(int on)
     gpio_set_level(BOARD_STATUS_LED_GPIO, on);
 }
 
-static can_t bus0, bus1;
+DORKY_EXT_BSS static can_t bus0, bus1;   /* ~10 KB, task-only */
 
 static uint32_t load_bus_bitrate_nvs(int bus_id)
 {
@@ -76,6 +77,7 @@ static void hw_init(void)
 
     led_rgb_init();
 
+    dorky_mem_mark("boot");
     state_nvs_init();  /* must come before reading bitrates from NVS */
     dorky_debug_init();
     dorky_debug_console_init();
@@ -93,15 +95,19 @@ static void hw_init(void)
     can_init(&bus0, 0);
     can_init(&bus1, 1);
 
+    dorky_mem_mark("can");
     fs_init();
+    dorky_mem_mark("fs");
     wifi_init();
+    dorky_mem_mark("wifi");
     tesla_ble_init();
     tesla_vehicle_init();
+    dorky_mem_mark("tesla");
 }
 
 /* ---- safe mode + console commands ---------------------------------- */
 
-static script_loader_t s_loader;
+DORKY_EXT_BSS static script_loader_t s_loader;
 static bool s_safe_mode;
 static bool s_scripts_restored;
 
@@ -160,7 +166,8 @@ static bool console_hook(const char *line, const char *lower)
 {
     if (strcmp(lower, "help") == 0) {
         printf("          scripts | script stop all | script stop <file> | script start <file>\n"
-               "          safe (stop all + autostart off) | filter | reboot\n");
+               "          safe (stop all + autostart off) | filter | reboot\n"
+               "          trace status | trace gate <free> <big> (bytes) | mem\n");
         return true;
     }
     if (strcmp(lower, "scripts") == 0 || strcmp(lower, "script list") == 0) {
@@ -208,6 +215,28 @@ static bool console_hook(const char *line, const char *lower)
             can_filter_format_csv(ids, n, csv, sizeof(csv));
             printf("bus%d: %s\n", b, n ? csv : "accept all");
         }
+        return true;
+    }
+    if (strcmp(lower, "trace status") == 0 || strcmp(lower, "trace") == 0) {
+        char st[384];
+        protocol_stats_line(st, sizeof st);
+        printf("%s\n", st);
+        return true;
+    }
+    if (strncmp(lower, "trace gate ", 11) == 0) {
+        unsigned fl = 0, big = 0;
+        if (sscanf(lower + 11, "%u %u", &fl, &big) < 1) {
+            printf("usage: trace gate <iram_free_floor> [<iram_big_floor>]\n");
+            return true;
+        }
+        dorky_ble_trace_gate_set(fl, big);
+        char st[384];
+        protocol_stats_line(st, sizeof st);
+        printf("%s\n", st);
+        return true;
+    }
+    if (strcmp(lower, "mem") == 0) {
+        dorky_mem_report();
         return true;
     }
     if (strcmp(lower, "reboot") == 0) {
@@ -260,8 +289,12 @@ static void app_task(void *arg)
     /* Defer restore_enabled until we've seen a CAN frame OR the startup window
      * elapses — keeps a faulty script from sending into a dead bus on boot. */
     protocol_init(&s_loader);
+    dorky_mem_mark("scripts");
     dorky_ble_init(protocol_on_ble_write, NULL);
-    http_file_server_start();
+    dorky_mem_mark("ble");
+    /* HTTP file server only once WiFi has an IP (saves its 8 KB internal
+     * stack + sockets when WiFi is unused). See loop below. */
+    bool http_started = false;
 
     /* Startup-delay guardrail: don't enable user scripts until we've seen the
      * buses come alive, or until this timeout fires. */
@@ -338,6 +371,10 @@ static void app_task(void *arg)
         }
 
         dorky_debug_console_poll();
+
+        if (!http_started && wifi_connected()) {
+            http_started = http_file_server_start() == ESP_OK;
+        }
 
         static uint32_t last_log_ms = 0;
         if ((now - last_log_ms) >= 1000) {

@@ -59,10 +59,31 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_ESP_WIFI_ENABLED=y
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
-# BLE under trace load (see protocol.c trace_flush): a few more host buffers
-# (internal RAM, +~6 KB) so ATT responses always find an mbuf next to batched
-# trace notifies. WiFi/LWIP buffers go to PSRAM to leave internal RAM for the
-# BT controller, which allocates from it at runtime ("BLE_INIT: Malloc failed").
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=32
+# BLE under trace load (see protocol.c trace_flush). Host buffers stay in
+# internal RAM (safest for the VHCI path); with batched trace 16/24 is plenty.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=16
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=24
+
+# ---- Internal-RAM budget --------------------------------------------------
+# The BT controller allocates from internal RAM at runtime; in 240d1ab only
+# ~17 KB were left with BLE connected. Everything that does not need
+# internal RAM goes to the 8 MB PSRAM:
+#  - malloc() >= 1 KB goes to PSRAM (was 16 KB: nearly every allocation
+#    landed in internal RAM). Explicit heap_caps(INTERNAL/DMA) users - BT
+#    controller, NimBLE, FreeRTOS objects, TWAI/SPI/USJ drivers - are not
+#    affected; the 32 KB internal reserve pool stays for them.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
+#  - large task-only static buffers marked DORKY_EXT_BSS (board/ext_ram.h)
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+#  - WiFi/LWIP buffers in PSRAM where possible; WiFi itself only starts when
+#    credentials exist (wifi.c). Fewer static RX/TX buffers (each ~1.6 KB
+#    internal), and WiFi hot paths in flash instead of IRAM (~15 KB more
+#    heap; WiFi is only used for the file server).
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+# CONFIG_ESP_WIFI_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_RX_IRAM_OPT is not set

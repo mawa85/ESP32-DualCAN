@@ -1,3 +1,4 @@
+#include "board/ext_ram.h"
 #include "version.h"
 #include "protocol/protocol.h"
 
@@ -123,8 +124,12 @@ static void send_frame_ex(cJSON *resp, int mode)
         /* All-or-nothing: only start if the msys pool clearly has room for
          * every chunk, so a dropped push never truncates the byte stream. */
         int need = (int)((total + chunk - 1) / chunk);
+        /* Status gate: host buffers only, no heap floor (see ble_transport.h).
+         * Short mutex wait so a status push isn't lost just because a trace
+         * notify is being queued; never wait inside the NimBLE host task. */
+        TickType_t mwait = in_nimble_host_task() ? 0 : pdMS_TO_TICKS(20);
         if (!dorky_ble_tx_credit(need) ||
-            (s_send_mutex && xSemaphoreTake(s_send_mutex, 0) != pdTRUE)) {
+            (s_send_mutex && xSemaphoreTake(s_send_mutex, mwait) != pdTRUE)) {
             s_dropped_pushes++;
             free(frame);
             free(json);
@@ -353,8 +358,10 @@ static const char HEX[] = "0123456789ABCDEF";
  *          existing web UI parser already loops over frames in a notify.
  *        - batch:true: one {"type":"trace_batch","f":[[bus,id,ts,"hex"],..]}
  *          per notify (~2.5x more frames per notify).
- *   3. A notify is only attempted when dorky_ble_tx_credit() says there are
- *      spare msys buffers and internal RAM, and at most TRACE_NOTIFY_HZ per
+ *   3. A notify is only attempted when dorky_ble_trace_credit() says there
+ *      are spare msys buffers and internal RAM above the trace floor (with
+ *      hysteresis; status pushes use a separate msys-only gate), and at
+ *      most TRACE_NOTIFY_HZ per
  *      second. Otherwise frames wait in the ring; when the ring overflows the
  *      oldest are dropped and counted (ble_dropped). Nothing ever retries.
  */
@@ -385,7 +392,7 @@ static uint32_t s_trace_dropped;       /* rate limit (max_fps) */
 static uint32_t s_trace_ble_dropped;   /* ring overflow / no BLE credit */
 static uint32_t s_trace_sent;          /* frames delivered to the stack */
 static uint32_t s_trace_notifies;
-static trace_item_t s_trace_ring[TRACE_RING];
+DORKY_EXT_BSS static trace_item_t s_trace_ring[TRACE_RING];
 static uint32_t s_trace_head, s_trace_tail;   /* head = write, tail = read */
 static uint32_t s_trace_last_flush_ms;
 static uint32_t s_trace_ntf_tokens;
@@ -550,7 +557,7 @@ static void trace_flush(uint32_t now)
     uint32_t full = (uint32_t)(cap / (s_trace_batch ? 32 : 80));
     if ((now - s_trace_last_flush_ms) < TRACE_FLUSH_MS && trace_pending() < full) return;
     if (!trace_notify_token(now)) return;
-    if (!dorky_ble_tx_credit(1)) return;               /* wait; ring absorbs */
+    if (!dorky_ble_trace_credit()) return;             /* wait; ring absorbs */
     if (s_send_mutex && xSemaphoreTake(s_send_mutex, 0) != pdTRUE) return;
 
     static uint8_t pkt[TRACE_PKT_MAX];
@@ -575,13 +582,20 @@ void protocol_stats_line(char *buf, size_t len)
     dorky_ble_tx_stats_t st;
     dorky_ble_tx_stats(&st);
     snprintf(buf, len,
-             "trace=%s fps=%" PRIu32 "%s sent=%" PRIu32 " ntf=%" PRIu32 " rate_drop=%" PRIu32
-             " ble_drop=%" PRIu32 " push_drop=%" PRIu32 " | ble ntf ok=%" PRIu32 " enomem=%" PRIu32
-             " err=%" PRIu32 " msys_free=%d iram_free=%u",
-             s_trace_buses ? "on" : "off", s_trace_fps, s_trace_batch ? " batch" : "",
+             "trace=%s buses=0x%02" PRIx32 " ids=%d fps=%" PRIu32 "%s pend=%" PRIu32
+             " sent=%" PRIu32 " ntf=%" PRIu32 " rate_drop=%" PRIu32
+             " ble_drop=%" PRIu32 " push_drop=%" PRIu32
+             " gate=%s(closed %" PRIu32 "x, floor %" PRIu32 "/%" PRIu32 ")"
+             " | ble ntf ok=%" PRIu32 " enomem=%" PRIu32
+             " err=%" PRIu32 " msys_free=%d iram_free=%u iram_big=%u",
+             s_trace_buses ? "on" : "off", (uint32_t)s_trace_buses, s_trace_id_count,
+             s_trace_fps, s_trace_batch ? " batch" : "", trace_pending(),
              s_trace_sent, s_trace_notifies, s_trace_dropped, s_trace_ble_dropped,
-             s_dropped_pushes, st.ok, st.enomem, st.err, st.msys_free,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+             s_dropped_pushes, st.gate_open ? "open" : "CLOSED", st.gate_closed,
+             st.iram_floor, st.iram_big_floor,
+             st.ok, st.enomem, st.err, st.msys_free,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 }
 
 static void push_bus_status(int bus, bus_status_t status, uint16_t rate)
@@ -775,7 +789,7 @@ static void handle_script_read(int id, cJSON *req)
     const cJSON *fn = cJSON_GetObjectItem(req, "filename");
     if (!cJSON_IsString(fn)) { send_err(id, "missing filename"); return; }
 
-    static char buf[16 * 1024];
+    DORKY_EXT_BSS static char buf[16 * 1024];
     int n = script_loader_read(fn->valuestring, buf, sizeof(buf));
     if (n < 0) { send_err(id, "read failed"); return; }
 
@@ -888,6 +902,11 @@ static void handle_trace_start(int id, cJSON *req)
 
     s_trace_head = s_trace_tail = 0;
     s_trace_batch = cJSON_IsTrue(batch_j);
+    /* Optional trace-gate floors in bytes (internal RAM free / largest block). */
+    const cJSON *fl_j = cJSON_GetObjectItem(req, "iram_floor");
+    const cJSON *fb_j = cJSON_GetObjectItem(req, "iram_big_floor");
+    dorky_ble_trace_gate_set(cJSON_IsNumber(fl_j) && fl_j->valuedouble > 0 ? (uint32_t)fl_j->valuedouble : 0,
+                             cJSON_IsNumber(fb_j) && fb_j->valuedouble > 0 ? (uint32_t)fb_j->valuedouble : 0);
     s_trace_ble_dropped = 0;
     s_trace_sent = 0;
     s_trace_notifies = 0;
@@ -920,6 +939,11 @@ static void handle_trace_stop(int id)
     cJSON_AddNumberToObject(result, "rate_dropped", (double)s_trace_dropped);
     cJSON_AddNumberToObject(result, "ble_dropped", (double)s_trace_ble_dropped);
     cJSON_AddNumberToObject(result, "push_dropped", (double)s_dropped_pushes);
+    {
+        dorky_ble_tx_stats_t bst;
+        dorky_ble_tx_stats(&bst);
+        cJSON_AddNumberToObject(result, "gate_closed", (double)bst.gate_closed);
+    }
     send_ok(id, result);
 }
 

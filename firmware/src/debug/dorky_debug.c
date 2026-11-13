@@ -10,6 +10,7 @@
 #include "ble/ble_transport.h"
 #include "can/can_driver.h"
 #include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -203,7 +204,7 @@ void dorky_debug_heartbeat(void)
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              ble, buses);
     {
-        char st[256];
+        char st[384];
         protocol_stats_line(st, sizeof st);
         ESP_LOGI(TAG, "hb %s", st);
     }
@@ -295,4 +296,43 @@ void dorky_debug_console_poll(void)
         if (len + 1 < sizeof(buf)) buf[len++] = c;
         else len = 0; /* overflow: drop the line */
     }
+}
+
+/* ---- memory diagnostics ------------------------------------------------ */
+
+void dorky_mem_mark(const char *stage)
+{
+    ESP_LOGI(TAG, "mem %-10s iram=%u big=%u min=%u psram=%u", stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+#define MEM_MAX_TASKS 24
+void dorky_mem_report(void)
+{
+    multi_heap_info_t in, ps;
+    heap_caps_get_info(&in, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    heap_caps_get_info(&ps, MALLOC_CAP_SPIRAM);
+    printf("internal: free=%u used=%u min=%u big=%u blocks=%u\n",
+           (unsigned)in.total_free_bytes, (unsigned)in.total_allocated_bytes,
+           (unsigned)in.minimum_free_bytes, (unsigned)in.largest_free_block,
+           (unsigned)in.allocated_blocks);
+    printf("dma-cap : free=%u big=%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    printf("psram   : free=%u used=%u min=%u big=%u\n",
+           (unsigned)ps.total_free_bytes, (unsigned)ps.total_allocated_bytes,
+           (unsigned)ps.minimum_free_bytes, (unsigned)ps.largest_free_block);
+#if configUSE_TRACE_FACILITY
+    static TaskStatus_t ts[MEM_MAX_TASKS];
+    UBaseType_t n = uxTaskGetSystemState(ts, MEM_MAX_TASKS, NULL);
+    printf("tasks (%u): name / prio / stack-free(min, bytes) / stack in\n", (unsigned)n);
+    for (UBaseType_t i = 0; i < n; i++) {
+        printf("  %-16s %2u  %5u  %s\n", ts[i].pcTaskName, (unsigned)ts[i].uxCurrentPriority,
+               (unsigned)ts[i].usStackHighWaterMark,
+               esp_ptr_external_ram(ts[i].pxStackBase) ? "PSRAM" : "internal");
+    }
+#endif
 }

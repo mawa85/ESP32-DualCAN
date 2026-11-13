@@ -163,6 +163,20 @@ static void vehicle_loop_task(void *)
     }
 }
 
+static TaskHandle_t s_loop_task;
+
+static bool ensure_loop_task(void)
+{
+    if (s_loop_task) return true;
+    if (xTaskCreate(vehicle_loop_task, "tesla_veh", 8192, nullptr,
+                    tskIDLE_PRIORITY + 1, &s_loop_task) != pdPASS) {
+        s_loop_task = nullptr;
+        ESP_LOGE(TAG, "tesla_veh task: out of memory");
+        return false;
+    }
+    return true;
+}
+
 /* ---- Central callbacks (called from NimBLE host task) ---- */
 
 static void on_central_connected(bool success, void *ctx)
@@ -250,10 +264,9 @@ extern "C" esp_err_t tesla_vehicle_init(void)
     if (tesla_ble_get_vin(vin, sizeof vin) == ESP_OK)
         s_vehicle->set_vin(vin);
 
-    xTaskCreate(vehicle_loop_task, "tesla_veh", 8192, nullptr,
-                tskIDLE_PRIORITY + 1, nullptr);
-
-    ESP_LOGI(TAG, "Vehicle object initialized");
+    /* The 8 KB loop task (internal-RAM stack: Vehicle::loop may write NVS,
+     * so the stack cannot live in PSRAM) is only started on first pairing. */
+    ESP_LOGI(TAG, "Vehicle object initialized (loop task on demand)");
     return ESP_OK;
 }
 
@@ -268,6 +281,7 @@ extern "C" esp_err_t tesla_vehicle_pair(const uint8_t addr[6],
     if (!tesla_ble_has_key()) return ESP_ERR_NOT_FOUND;
     if (role != 2 && role != 3 && role != 5 && role != 6 && role != 8)
         return ESP_ERR_INVALID_ARG;
+    if (!ensure_loop_task()) return ESP_ERR_NO_MEM;
 
     s_pair_cb   = cb;
     s_pair_ctx  = ctx;

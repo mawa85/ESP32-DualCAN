@@ -13,6 +13,9 @@ void wifi_init(void);
 
 bool wifi_connected(void);
 
+/* True once the WiFi driver has been started (creds present). */
+bool wifi_driver_running(void);
+
 /* Copies the current STA IPv4 address into buf as "x.x.x.x", or "" if not
  * connected. buf must be at least 16 bytes. */
 void wifi_get_ip(char *buf, size_t buf_len);

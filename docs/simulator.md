@@ -202,7 +202,11 @@ Konsole: `filter` zeigt die aktiven Listen.
 - Trace wird gebündelt: höchstens 40 Notifies/s, je Notify so viele Frames wie in MTU−3 Bytes passen (alle 25 ms oder wenn voll).
   - Standard: alte `{"type":"trace",…}`-Frames hintereinander in einem Notify (alte Web-UI versteht das).
   - `trace.start {…, batch:true}`: kompakt `{"type":"trace_batch","f":[[bus,id,ts,"HEX"],…]}`, etwa 18 statt 7 Frames pro Notify. Die neue Web-UI fragt das an.
-- Gesendet wird nur, wenn genug NimBLE-Puffer (msys) und mindestens 24 KB interner RAM frei sind. Sonst warten die Frames in einem Ring (128). Läuft der Ring über, fallen die ältesten weg.
+- Trace wird nur gesendet, wenn genug NimBLE-Puffer (msys) frei sind und der interne RAM über der Trace-Schwelle liegt: frei ≥ 10 KB und größter Block ≥ 4 KB, mit 4 KB Hysterese. Sonst warten die Frames in einem Ring (128). Läuft der Ring über, fallen die ältesten weg.
+  - Schwellen ändern: `trace.start {…, iram_floor:8192, iram_big_floor:4096}` oder USB-Konsole `trace gate 8192 4096`.
+- Status-Pushes (Bus-Status, CPU, Script-Status, Logs) prüfen nur die msys-Puffer, nie den Heap. Antworten auf Befehle warten immer.
+- USB-Konsole: `trace status` zeigt die Zähler, `mem` zeigt internen RAM, PSRAM und die Task-Stacks. Beim Booten stehen `mem boot/can/fs/wifi/tesla/scripts/ble`-Zeilen im Log.
+- WLAN startet nur, wenn Zugangsdaten gespeichert sind (sonst bleibt es aus und spart internen RAM). Der Datei-Server startet erst, wenn WLAN eine IP hat.
 - `trace.stop` liefert `sent`, `notifies`, `rate_dropped` (max_fps), `ble_dropped` (Ring/BLE voll), `push_dropped` und `dropped` (alter Name für `rate_dropped`).
 - Heartbeat (Debug an) zeigt `iram`/`iram_min` und eine Zeile `trace=… sent=… rate_drop=… ble_drop=… | ble ntf ok=… enomem=… msys_free=…`.
 

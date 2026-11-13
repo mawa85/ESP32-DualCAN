@@ -1,3 +1,4 @@
+#include "board/ext_ram.h"
 #include "scripting/script_loader.h"
 #include "scripting/berry_log.h"
 #include "scripting/berry_registry.h"
@@ -27,7 +28,7 @@ static const char *strip_script_dir(const char *err) {
     return err;
 }
 #define ENABLED_FILE SCRIPT_DIR "/.enabled"
-static script_entry_t s_scan_existing[SCRIPT_MAX_COUNT];
+DORKY_EXT_BSS static script_entry_t s_scan_existing[SCRIPT_MAX_COUNT];
 static int            s_next_script_id = 1;   /* 0 reserved for "no context" */
 
 static bool source_to_runtime_path(const char *filename, char *path, size_t path_size)

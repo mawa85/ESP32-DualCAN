@@ -665,14 +665,44 @@ int dorky_ble_notify(const uint8_t *data, size_t len)
 bool dorky_ble_tx_credit(int chunks)
 {
     if (!dorky_ble_tx_ready()) return false;
-    /* Keep a reserve of host buffers for ATT responses / SMP / L2CAP. */
-    if (os_msys_num_free() < chunks * 2 + DORKY_BLE_MSYS_RESERVE) return false;
-    /* The BT controller allocates from internal RAM at runtime; when that
-     * runs dry it hits "BLE_INIT: Malloc failed" and later asserts in its
-     * own task. Never add optional traffic below this watermark. */
-    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < DORKY_BLE_INTERNAL_RESERVE)
-        return false;
-    return true;
+    /* Status/control pushes: just enough host buffers for this frame plus a
+     * tiny reserve for ATT responses. No heap check (see header). */
+    return os_msys_num_free() >= chunks + DORKY_BLE_MSYS_STATUS_RESERVE;
+}
+
+static uint32_t s_trace_iram_floor = DORKY_BLE_TRACE_IRAM_FLOOR;
+static uint32_t s_trace_iram_big_floor = DORKY_BLE_TRACE_IRAM_BIG_FLOOR;
+static bool     s_trace_gate_open = true;
+static uint32_t s_trace_gate_closed;
+
+void dorky_ble_trace_gate_set(uint32_t iram_floor, uint32_t iram_big_floor)
+{
+    if (iram_floor) s_trace_iram_floor = iram_floor;
+    if (iram_big_floor) s_trace_iram_big_floor = iram_big_floor;
+    s_trace_gate_open = true;     /* re-evaluated on the next call */
+}
+
+bool dorky_ble_trace_credit(void)
+{
+    if (!dorky_ble_tx_ready()) return false;
+    /* One trace notify is <= 509 B = at most 2 msys blocks; keep a reserve
+     * for ATT responses / SMP / L2CAP on top. */
+    if (os_msys_num_free() < 2 + DORKY_BLE_MSYS_RESERVE) return false;
+
+    size_t free_b = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t big_b  = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_trace_gate_open) {
+        if (free_b < s_trace_iram_floor || big_b < s_trace_iram_big_floor) {
+            s_trace_gate_open = false;
+            s_trace_gate_closed++;
+        }
+    } else {
+        /* Hysteresis: reopen only with clear headroom. */
+        if (free_b >= s_trace_iram_floor + DORKY_BLE_TRACE_IRAM_HYST &&
+            big_b >= s_trace_iram_big_floor)
+            s_trace_gate_open = true;
+    }
+    return s_trace_gate_open;
 }
 
 void dorky_ble_tx_stats(dorky_ble_tx_stats_t *out)
@@ -683,6 +713,10 @@ void dorky_ble_tx_stats(dorky_ble_tx_stats_t *out)
     out->err = s_ntf_err;
     out->tx_events = s_ntf_tx_events;
     out->msys_free = os_msys_num_free();
+    out->gate_open = s_trace_gate_open;
+    out->gate_closed = s_trace_gate_closed;
+    out->iram_floor = s_trace_iram_floor;
+    out->iram_big_floor = s_trace_iram_big_floor;
 }
 
 bool dorky_ble_tx_ready(void)
