@@ -26,6 +26,7 @@
 #include "wifi/wifi.h"
 #include "ota/ota.h"
 #include "storage/state.h"
+#include "debug/dorky_debug.h"
 #include "storage/fs.h"
 #include "nvs.h"
 
@@ -986,9 +987,28 @@ static void handle_log_set_level(int id, cJSON *req)
     const char *tag = (cJSON_IsString(tag_j) && tag_j->valuestring[0]) ? tag_j->valuestring : "*";
     esp_log_level_set(tag, level);
     if (strcmp(tag, "*") == 0)
-        // keep ble logs below debug to avoid recursion / flooding the transport
-        esp_log_level_set("ble", ESP_LOG_WARN);
+        dorky_debug_apply_log_levels();
     send_ok(id, NULL);
+}
+
+static void handle_log_set_debug(int id, cJSON *req)
+{
+    const cJSON *en = cJSON_GetObjectItem(req, "enabled");
+    if (!cJSON_IsBool(en)) { send_err(id, "missing enabled"); return; }
+    if (dorky_debug_set(cJSON_IsTrue(en)) != ESP_OK) {
+        send_err(id, "NVS write failed");
+        return;
+    }
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddBoolToObject(result, "enabled", dorky_debug_enabled());
+    send_ok(id, result);
+}
+
+static void handle_log_get_debug(int id)
+{
+    cJSON *result = cJSON_CreateObject();
+    cJSON_AddBoolToObject(result, "enabled", dorky_debug_enabled());
+    send_ok(id, result);
 }
 
 static void handle_log_get_level(int id)
@@ -1120,6 +1140,8 @@ static void dispatch_frame(const uint8_t *payload, size_t len)
     else if (strcmp(op_s, "sim.set") == 0)         handle_sim_set(id, req);
     else if (strcmp(op_s, "log.set_level") == 0)   handle_log_set_level(id, req);
     else if (strcmp(op_s, "log.get_level") == 0)   handle_log_get_level(id);
+    else if (strcmp(op_s, "log.set_debug") == 0)   handle_log_set_debug(id, req);
+    else if (strcmp(op_s, "log.get_debug") == 0)   handle_log_get_debug(id);
     else if (strcmp(op_s, "tesla.status") == 0)        handle_tesla_status(id);
     else if (strcmp(op_s, "tesla.gen_key") == 0)       handle_tesla_gen_key(id);
     else if (strcmp(op_s, "tesla.reset") == 0)         handle_tesla_reset(id);

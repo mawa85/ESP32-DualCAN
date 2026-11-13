@@ -33,3 +33,10 @@ int dorky_ble_bond_count(void);
 /* Wipe all stored bonds. Disconnects the active client (if any) so the next
  * connection has to re-pair from scratch. Returns 0 on success. */
 int dorky_ble_reset_pairings(void);
+
+/* Compact BLE status for the debug heartbeat. Always safe to call. */
+void dorky_ble_debug_snapshot(char *buf, size_t len);
+
+/* True while the active connection is authorized to write GATT. */
+bool dorky_ble_authorized(void);
+

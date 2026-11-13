@@ -72,6 +72,8 @@ Do not flash an `esp32-c6` binary onto the T-2CAN FD.
 ```bash
 cd firmware
 pio device monitor               # serial console (115200 baud)
+# On the console: "debug on" / "debug off" / "debug status"
+# (persistent NVS flag; see docs/ble.md, section Debug-Modus)
 pio test -e tests-native         # host unit tests (gcc required), including ACAN2517FD bit timing
 pio test -e esp32-c6-tests-arduino  # hardware smoke tests (board connected)
 ```

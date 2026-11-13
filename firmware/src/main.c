@@ -25,6 +25,7 @@
 #include "http_file_server/http_file_server.h"
 #include "ota/ota.h"
 #include "board/board.h"
+#include "debug/dorky_debug.h"
 
 static const char *TAG = "dorky";
 
@@ -64,6 +65,8 @@ static void hw_init(void)
     led_rgb_init();
 
     state_nvs_init();  /* must come before reading bitrates from NVS */
+    dorky_debug_init();
+    dorky_debug_console_init();
 
     can_bus_config_t c0, c1;
     board_can_config(0, load_bus_bitrate_nvs(0), &c0);
@@ -84,6 +87,7 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Dorky Commander starting on %s (version %s)",
              BOARD_NAME, DORKY_FIRMWARE_VERSION);
+    dorky_debug_log_reset_reason();
     ota_log_boot_info();
     vTaskDelay(pdMS_TO_TICKS(2000));
 
@@ -173,15 +177,18 @@ void app_main(void)
             status_led(dorky_ble_pairing_open() || now < led_on_until ? 1 : 0);
         }
 
+        dorky_debug_console_poll();
+
         static uint32_t last_log_ms = 0;
         if ((now - last_log_ms) >= 1000) {
             last_log_ms = now;
             ESP_LOGV(TAG, "tick %" PRIu32 " | free heap: %" PRIu32 " bytes",
                      tick, (uint32_t)esp_get_free_heap_size());
-
-            static char stats[1024];
-            // vTaskGetRunTimeStats(stats);
-            // printf("--- CPU usage ---\n%s\n", stats);
+        }
+        static uint32_t last_hb_ms = 0;
+        if (dorky_debug_enabled() && (now - last_hb_ms) >= 10000) {
+            last_hb_ms = now;
+            dorky_debug_heartbeat();
         }
         tick++;
         vTaskDelay(pdMS_TO_TICKS(1));

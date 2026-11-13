@@ -449,6 +449,15 @@ export class Protocol {
     return this.call('log.set_level', { level, tag });
   }
 
+  /** Persistent firmware debug flag (NVS). Survives reboot; not a log-level. */
+  getDebug(): Promise<{ enabled: boolean }> {
+    return this.call('log.get_debug');
+  }
+
+  setDebug(enabled: boolean): Promise<{ enabled: boolean }> {
+    return this.call('log.set_debug', { enabled });
+  }
+
   bleStatus(): Promise<{ pairing_open: boolean; bond_count: number }> {
     return this.call('ble.status');
   }

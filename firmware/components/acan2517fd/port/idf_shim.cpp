@@ -4,8 +4,25 @@
 
 #include "driver/gpio.h"
 #include "esp_timer.h"
+#include "dorky_gpio_isr.h"
 
 static void (*s_gpio_isr)(void) = nullptr;
+
+static bool s_isr_service_up = false;
+
+extern "C" esp_err_t dorky_gpio_isr_service_ensure(void)
+{
+    if (s_isr_service_up) return ESP_OK;
+    esp_err_t err = gpio_install_isr_service(0);
+    /* Already-installed is success; skip the IDF call next time so the
+     * "GPIO isr service already installed" error is not logged. */
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        s_isr_service_up = true;
+        return ESP_OK;
+    }
+    return err;
+}
+
 
 static void gpio_thunk(void *arg)
 {
@@ -42,8 +59,7 @@ void attachInterrupt(uint8_t pin, void (*isr)(void), int mode)
 {
     (void)mode;
     s_gpio_isr = isr;
-    esp_err_t err = gpio_install_isr_service(0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return;
+    if (dorky_gpio_isr_service_ensure() != ESP_OK) return;
     gpio_set_intr_type(static_cast<gpio_num_t>(pin), GPIO_INTR_NEGEDGE);
     gpio_isr_handler_remove(static_cast<gpio_num_t>(pin));
     gpio_isr_handler_add(static_cast<gpio_num_t>(pin), gpio_thunk, nullptr);
